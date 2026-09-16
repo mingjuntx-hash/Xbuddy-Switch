@@ -38,11 +38,11 @@ jobs:
         run: npm run build:demo
 
       - name: Configure Pages
+        # 首次部署前需要在仓库 Settings → Pages 里把 Source 设为「GitHub Actions」。
+        # 这一步无法自动化：GITHUB_TOKEN 调 POST /repos/{owner}/{repo}/pages 会被拒
+        # （Resource not accessible by integration），configure-pages 的 enablement: true
+        # 因此也无效，实测确认。站点建好之后本步骤一直通过。
         uses: actions/configure-pages@v5
-        with:
-          # 仓库首次部署时 Pages 站点可能尚未创建，开这个开关让工作流自行开启，
-          # 省掉「Settings → Pages → Source 选 GitHub Actions」这一步人工操作。
-          enablement: true
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
