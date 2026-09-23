@@ -492,7 +492,7 @@ foreach ($hive in $unHives) {
     $dn = $_.GetValue('DisplayName')
     if (-not $dn) { return }
     $dnl = [string]$dn
-    if ($dnl -match 'workbuddy-switch|wb-switch') { return }
+    if ($dnl -match 'workbuddy-switch|wb-switch|xbuddy-switch') { return }
     if ($dnl -match 'CodeBuddy CN') { return }
     if ($dnl -notmatch 'CodeBuddy') { return }
     $icon = $_.GetValue('DisplayIcon')
@@ -572,7 +572,10 @@ fn windows_ide_exe_path_resolved() -> Option<PathBuf> {
 )]
 fn linux_cmdline_is_codebuddy_ide(cmdline: &str) -> bool {
     let lower = cmdline.to_ascii_lowercase();
-    if lower.contains("wb-switch") || lower.contains("workbuddy-switch") {
+    if lower.contains("wb-switch")
+        || lower.contains("workbuddy-switch")
+        || lower.contains("xbuddy-switch")
+    {
         return false;
     }
     if lower.contains("crashpad") || lower.contains("--type=") {
@@ -1162,6 +1165,7 @@ mod tests {
         assert!(!is_codebuddy_ide_image_name("CodeBuddy CN.exe"));
         assert!(!is_codebuddy_ide_image_name("WorkBuddy.exe"));
         assert!(!is_codebuddy_ide_image_name("workbuddy-switch.exe"));
+        assert!(!is_codebuddy_ide_image_name("xbuddy-switch.exe"));
         assert!(is_codebuddy_ide_windows_exe(
             r"C:\Users\Zhou\AppData\Local\Programs\CodeBuddy\CodeBuddy.exe"
         ));
@@ -1225,6 +1229,7 @@ mod tests {
         assert!(linux_cmdline_is_codebuddy_ide("/usr/bin/CodeBuddy"));
         assert!(linux_exe_is_codebuddy_ide(Path::new("/usr/bin/codebuddy")));
         assert!(!linux_cmdline_is_codebuddy_ide("/usr/bin/workbuddy-switch"));
+        assert!(!linux_cmdline_is_codebuddy_ide("/usr/bin/xbuddy-switch"));
         assert!(!linux_cmdline_is_codebuddy_ide(
             "/opt/CodeBuddy CN/codebuddy-cn"
         ));

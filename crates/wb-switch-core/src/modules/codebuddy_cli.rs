@@ -310,7 +310,10 @@ fn sync_cli_runtime_cache(settings: &Path, variant: WbVariant) -> Result<(), Str
 #[cfg_attr(all(target_os = "windows", not(test)), allow(dead_code))]
 fn is_codebuddy_cli_process_args(args: &str) -> bool {
     let lower = args.to_ascii_lowercase();
-    if lower.contains("wb-switch") || lower.contains("workbuddy-switch") {
+    if lower.contains("wb-switch")
+        || lower.contains("workbuddy-switch")
+        || lower.contains("xbuddy-switch")
+    {
         return false;
     }
     if lower.contains(".app/contents/") {

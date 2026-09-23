@@ -426,7 +426,7 @@ pub fn notify_rotate_deferred<R: Runtime>(app: &AppHandle<R>, notify: &Value) {
     let title = notify
         .get("title")
         .and_then(Value::as_str)
-        .unwrap_or("workbuddy-switch");
+        .unwrap_or("xbuddy-switch");
     let Some(body) = notify.get("body").and_then(Value::as_str) else {
         return;
     };

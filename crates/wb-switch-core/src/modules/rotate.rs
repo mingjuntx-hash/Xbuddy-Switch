@@ -40,7 +40,7 @@ const DAY_MS: i64 = 24 * 3_600_000;
 const SKIP_LIVE_SESSION_REASON: &str = "有 CodeBuddy CLI 会话在运行，暂不切换";
 
 /// 推迟提示的通知标题（返回体里的 `notify.title` 与宿主投递用的是同一个值）。
-const ROTATE_NOTIFY_TITLE: &str = "workbuddy-switch";
+const ROTATE_NOTIFY_TITLE: &str = "xbuddy-switch";
 
 /// 单个账号的积分候选（从 get_credit_expiry 提取，不携带 token）。
 #[derive(Debug, Clone)]
@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn deferred_notify_text_is_built_in_one_place() {
         let notify = rotate_deferred_notify("账号B", Some(1));
-        assert_eq!(notify["title"], json!("workbuddy-switch"));
+        assert_eq!(notify["title"], json!("xbuddy-switch"));
         assert_eq!(
             notify["body"],
             json!("「账号B」的积分 1 天后到期，但检测到有 CodeBuddy CLI 会话在运行；重启 CLI 后新账号才会生效。")

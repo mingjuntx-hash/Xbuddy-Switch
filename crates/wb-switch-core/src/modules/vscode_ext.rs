@@ -301,7 +301,10 @@ fn macos_code_main_patterns() -> Vec<String> {
 )]
 fn linux_cmdline_is_code(cmdline: &str) -> bool {
     let lower = cmdline.to_ascii_lowercase();
-    if lower.contains("wb-switch") || lower.contains("workbuddy-switch") {
+    if lower.contains("wb-switch")
+        || lower.contains("workbuddy-switch")
+        || lower.contains("xbuddy-switch")
+    {
         return false;
     }
     if lower.contains("crashpad") || lower.contains("--type=") {
@@ -1066,6 +1069,7 @@ mod tests {
         assert!(!is_code_image_name("CodeBuddy CN.exe"));
         assert!(!is_code_image_name("CodeBuddy.exe"));
         assert!(!is_code_image_name("workbuddy-switch.exe"));
+        assert!(!is_code_image_name("xbuddy-switch.exe"));
         assert!(!is_code_image_name("wb-switch"));
     }
 
@@ -1093,6 +1097,7 @@ mod tests {
         assert!(linux_cmdline_is_code("/usr/bin/code --no-sandbox"));
         assert!(linux_exe_is_code(std::path::Path::new("/usr/share/code/code")));
         assert!(!linux_cmdline_is_code("/usr/bin/workbuddy-switch"));
+        assert!(!linux_cmdline_is_code("/usr/bin/xbuddy-switch"));
         assert!(!linux_cmdline_is_code("/usr/share/code/code --type=gpu-process"));
         assert!(!linux_cmdline_is_code("/usr/bin/code-insiders"));
         assert!(!linux_cmdline_is_code("/opt/codebuddy-cn/codebuddy-cn"));

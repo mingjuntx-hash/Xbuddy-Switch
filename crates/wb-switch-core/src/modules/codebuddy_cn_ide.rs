@@ -1507,6 +1507,12 @@ mod tests {
             &format!("{} %U", exe.display()),
         );
         assert_eq!(linux_cn_exe_from_desktop_entry(&own), None);
+        let own_fork = write(
+            "xbuddy-switch.desktop",
+            "xbuddy-switch",
+            &format!("{} %U", exe.display()),
+        );
+        assert_eq!(linux_cn_exe_from_desktop_entry(&own_fork), None);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
