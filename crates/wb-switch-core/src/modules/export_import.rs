@@ -417,12 +417,15 @@ mod tests {
             validate_export_path("relative/out.json").is_err(),
             "必须绝对路径"
         );
-        assert!(validate_export_path("/tmp/out.txt").is_err(), "必须 .json");
-        assert!(
-            validate_export_path("/tmp/out.JSON").is_ok(),
-            "扩展名不区分大小写"
-        );
-        assert!(validate_export_path("/tmp/out.json").is_ok());
+        // 绝对路径的形态按平台不同（Windows 需盘符或 UNC 前缀），fixture 必须取自
+        // 当前平台：写死 `/tmp/...` 会在 Windows 上被判为相对路径而误报。
+        let dir = std::env::temp_dir();
+        let txt = dir.join("out.txt").to_string_lossy().to_string();
+        let upper = dir.join("out.JSON").to_string_lossy().to_string();
+        let json = dir.join("out.json").to_string_lossy().to_string();
+        assert!(validate_export_path(&txt).is_err(), "必须 .json");
+        assert!(validate_export_path(&upper).is_ok(), "扩展名不区分大小写");
+        assert!(validate_export_path(&json).is_ok());
     }
 
     #[test]

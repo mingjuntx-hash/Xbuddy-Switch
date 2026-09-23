@@ -8,21 +8,35 @@ use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-use crate::modules::account::{account_display_name, build_auth_headers};
-use crate::modules::config::{http_request, load_checkin_config, now_ms, WORKBUDDY_API_ENDPOINT};
+use crate::modules::account::{
+    account_display_name, build_auth_headers, envelope_token_error, variant_of,
+};
+use crate::modules::config::{
+    http_request, is_route_missing, load_checkin_config, now_ms, CHECKIN_API_PREFIX,
+    WORKBUDDY_API_ENDPOINT,
+};
 use crate::modules::credit_usage;
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
+use crate::modules::variant::WbVariant;
 
-const USER_RESOURCE_PATH: &str = "/v2/billing/meter/get-user-resource";
+/// 旧资源接口路径后缀（按档位生成完整候选，见 `WbVariant::billing_paths`）。
+const USER_RESOURCE_SUFFIX: &str = "/get-user-resource";
 const WORKBUDDY_WEB_ENDPOINT: &str = "https://www.workbuddy.cn";
 const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
 const RESOURCE_PAID_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-paid-packages";
 const RESOURCE_FREE_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-free-packages";
 const PRODUCT_CODE: &str = "p_tcaca";
 const EXPIRING_SOON_DAYS: i64 = 7;
+/// DeductionEndTime 比 CycleEndTime 晚超过该天数时，视前者为长期占位
+/// （官方数据形态：如 035 的 DeductionEndTime=2049 与 CycleEndTime=当月月底并存），改用 CycleEndTime。
+const EXPIRY_CYCLE_OVERRIDE_DAYS: i64 = 365;
+/// 最终解析出的到期时间距 now 超过该天数时视为长期有效（expireAt=null），
+/// 避免 2049 这类占位值流入前端。
+const FAR_FUTURE_EXPIRY_DAYS: i64 = 730;
 
-// WorkBuddy CN UserCenter 的商品码（来自其公开套餐配置）。解析器不会依赖
-// 这些常量，因此上游新增商品时仍可通过 summary/明细返回资源。
+// 付费/免费包查询码表：国内版公开套餐配置 ∪ 官网 usercenter 国际版码集
+// ∪ 官方客户端 PAID/FREE_PACKAGE_CODES。请求体多带码对不存在的包无副作用；
+// 解析器不依赖这份清单，summary 仍可带回未列出的包（但无时间字段）。
 const PAID_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_002_AkiJS3ZHF5",
     "TCACA_code_023_4xbGhMrE6q",
@@ -30,6 +44,8 @@ const PAID_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_027_0FCGVA6vSa",
     "TCACA_code_009_0XmEQc2xOf",
     "TCACA_code_038_OhvqZtiPKr",
+    "TCACA_code_003_FAnt7lcmRT",
+    "TCACA_code_036_lupO5WgNdG",
 ];
 const FREE_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_008_cfWoLwvjU4",
@@ -37,6 +53,12 @@ const FREE_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_028_NtpWi0jzXs",
     "TCACA_code_029_6wCGEWquYy",
     "TCACA_code_030_BjSt89qTvr",
+    "TCACA_code_001_PqouKr6QWV",
+    "TCACA_code_006_DbXS0lrypC",
+    "TCACA_code_035_ArVxJcGDsm",
+    "TCACA_code_037_WxOD3MpI2o",
+    "TCACA_code_039_KRcQj7wUat",
+    "TCACA_code_040_mi9rCYg46x",
 ];
 
 fn first_value<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
@@ -52,8 +74,7 @@ fn parse_number(value: Option<&Value>) -> Option<f64> {
 }
 
 fn first_number(value: &Value, keys: &[&str]) -> Option<f64> {
-    keys.iter()
-        .find_map(|key| parse_number(value.get(*key)))
+    keys.iter().find_map(|key| parse_number(value.get(*key)))
 }
 
 fn parse_timestamp_ms(value: Option<&Value>) -> Option<i64> {
@@ -146,9 +167,11 @@ fn has_resource_accounts(response: &Value) -> bool {
         &["data", "accounts"],
         &["data", "data", "accounts"],
     ];
-    paths
-        .iter()
-        .any(|path| value_at_path(response, path).and_then(Value::as_array).is_some())
+    paths.iter().any(|path| {
+        value_at_path(response, path)
+            .and_then(Value::as_array)
+            .is_some()
+    })
 }
 
 fn has_resource_packages(response: &Value) -> bool {
@@ -160,9 +183,37 @@ fn has_resource_packages(response: &Value) -> bool {
         &["data", "packages"],
         &["data", "data", "packages"],
     ];
-    paths
-        .iter()
-        .any(|path| value_at_path(response, path).and_then(Value::as_array).is_some())
+    paths.iter().any(|path| {
+        value_at_path(response, path)
+            .and_then(Value::as_array)
+            .is_some()
+    })
+}
+
+/// 到期时间：优先 DeductionEndTime/ExpiredTime；仅当 CycleEndTime 比其早超过
+/// `EXPIRY_CYCLE_OVERRIDE_DAYS` 时改用周期结束时间（视前者为长期占位）。
+/// 最终值距 now 超过 `FAR_FUTURE_EXPIRY_DAYS` 则视为长期有效。
+fn resolve_expire_at(raw: &Value, now: i64) -> Option<i64> {
+    let deduction_end = parse_timestamp_ms(first_value(
+        raw,
+        &[
+            "DeductionEndTime",
+            "deductionEndTime",
+            "ExpiredTime",
+            "expiredTime",
+        ],
+    ));
+    let cycle_end = parse_timestamp_ms(first_value(raw, &["CycleEndTime", "cycleEndTime"]));
+    let override_ms = EXPIRY_CYCLE_OVERRIDE_DAYS * 24 * 3600 * 1000;
+    let expire_at = match (deduction_end, cycle_end) {
+        (Some(deduction), Some(cycle)) if deduction.saturating_sub(cycle) > override_ms => {
+            Some(cycle)
+        }
+        (Some(deduction), _) => Some(deduction),
+        (None, cycle) => cycle,
+    };
+    let far_future_ms = FAR_FUTURE_EXPIRY_DAYS * 24 * 3600 * 1000;
+    expire_at.filter(|value| value.saturating_sub(now) <= far_future_ms)
 }
 
 fn resource_summary(raw: &Value, now: i64) -> Value {
@@ -203,7 +254,11 @@ fn resource_summary(raw: &Value, now: i64) -> Value {
     let raw_used = first_number(raw, &used_keys)
         .or_else(|| slice.and_then(|value| first_number(value, &used_keys)));
     let total = raw_total
-        .or_else(|| raw_remaining.zip(raw_used).map(|(remaining, used)| remaining + used))
+        .or_else(|| {
+            raw_remaining
+                .zip(raw_used)
+                .map(|(remaining, used)| remaining + used)
+        })
         .or(raw_remaining)
         .or(raw_used)
         .unwrap_or(0.0)
@@ -214,17 +269,7 @@ fn resource_summary(raw: &Value, now: i64) -> Value {
     let used = raw_used
         .unwrap_or_else(|| (total - remaining).max(0.0))
         .max(0.0);
-    let expire_at = parse_timestamp_ms(first_value(
-        raw,
-        &[
-            "DeductionEndTime",
-            "deductionEndTime",
-            "ExpiredTime",
-            "expiredTime",
-            "CycleEndTime",
-            "cycleEndTime",
-        ],
-    ));
+    let expire_at = resolve_expire_at(raw, now);
     let expired = expire_at.map(|value| value <= now).unwrap_or(false);
     let expiring_soon = expire_at
         .map(|value| value > now && value - now <= EXPIRING_SOON_DAYS * 24 * 3600 * 1000)
@@ -325,6 +370,10 @@ fn is_transport_error(response: &Value) -> bool {
 /// 新鲜，遇到未授权时使用 refresh token 重试一次。调用方只拿到上游 JSON，
 /// 不会把认证字段拼进返回值。
 pub async fn authenticated_post(account: &Value, url: &str, body: Value) -> Value {
+    // 加密信封凭据短路：不发空 Bearer，直接给出可读错误（issue #94）。
+    if let Some(err) = envelope_token_error(account) {
+        return json!({"code": -2, "message": err});
+    }
     let config = load_checkin_config();
     let mut working_account = ensure_fresh_token(account.clone(), &config).await;
     let mut response = post_with_account(&working_account, url, body.clone()).await;
@@ -354,11 +403,20 @@ async fn post_with_account(account: &Value, url: &str, body: Value) -> Value {
 }
 
 fn request_origin(url: &str) -> &'static str {
-    if url.starts_with(WORKBUDDY_WEB_ENDPOINT) {
-        WORKBUDDY_WEB_ENDPOINT
-    } else {
-        WORKBUDDY_API_ENDPOINT
-    }
+    // Origin 跟随本次请求 host（契约不变）；新增国际版域后必须同步登记，
+    // 否则国际版请求会带上国内 Origin 并被网关的一致性校验拒绝。
+    // 只认「host 完全相同或后接 `/`」的前缀，避免相似域名被误当成已知 origin。
+    [
+        WbVariant::Ai.api_endpoint(),
+        WORKBUDDY_WEB_ENDPOINT,
+        WORKBUDDY_API_ENDPOINT,
+    ]
+    .into_iter()
+    .find(|origin| match url.strip_prefix(origin) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    })
+    .unwrap_or(WORKBUDDY_API_ENDPOINT)
 }
 
 fn resource_auth_headers(
@@ -393,7 +451,10 @@ fn paid_packages_body() -> Value {
 
 fn free_packages_body() -> Value {
     let now = Local::now();
-    let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap_or(now.naive_local());
+    let start = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or(now.naive_local());
     let end = now
         .date_naive()
         .and_hms_opt(23, 59, 59)
@@ -408,11 +469,18 @@ fn free_packages_body() -> Value {
     })
 }
 
-fn new_resource_endpoint(account: &Value) -> &'static str {
+/// 按账号档位/域名选本次请求的基址。
+///
+/// - 国际版：固定国际版 API 域（不做域名兜底，避免把 AI token 打到国内域）；
+/// - 国内版：保持既有 domain 逻辑（workbuddy.cn / codebuddy.cn 二选一）。
+pub fn api_base_for(account: &Value) -> &'static str {
+    if variant_of(account) == WbVariant::Ai {
+        return WbVariant::Ai.api_endpoint();
+    }
     // 官网脚本使用相对路径，实际请求的是当前登录 origin。账号库中的 CN
     // OAuth token 默认签发给 www.codebuddy.cn；若把它固定发往
     // www.workbuddy.cn，令牌域和 X-Domain 会不一致并被网关拒绝。
-    // 这里只在两个已知官方 origin 间选择，不允许账号数据拼出任意主机。
+    // 这里只在已知官方 origin 间选择，不允许账号数据拼出任意主机。
     match account
         .get("domain")
         .and_then(Value::as_str)
@@ -425,8 +493,22 @@ fn new_resource_endpoint(account: &Value) -> &'static str {
     }
 }
 
-fn new_resource_url(account: &Value, path: &str) -> String {
-    format!("{}{path}", new_resource_endpoint(account))
+/// 依次尝试路径候选，**只有 404 才回落**到下一个候选。
+///
+/// 401/403/10085/传输错误都必须原样返回：把它们当成「路径不对」会掩盖真因，
+/// 也会让上层误判为可重试（见 design D4 与 credits 既有契约）。
+async fn post_with_fallback(account: &Value, paths: &[String], body: Value) -> Value {
+    let base = api_base_for(account);
+    let mut last = json!({"code": -1, "message": "无可用接口路径"});
+    for (index, path) in paths.iter().enumerate() {
+        let url = format!("{base}{path}");
+        let response = post_with_account(account, &url, body.clone()).await;
+        if index + 1 == paths.len() || !is_route_missing(&response) {
+            return response;
+        }
+        last = response;
+    }
+    last
 }
 
 struct NewResourceResponses {
@@ -440,11 +522,11 @@ struct NewResourceResponses {
 async fn retry_new_response_if_unauthorized(
     account: &Value,
     response: Value,
-    url: &str,
+    paths: &[String],
     body: Value,
 ) -> Value {
     if is_unauthorized(&response) {
-        post_with_account(account, url, body).await
+        post_with_fallback(account, paths, body).await
     } else {
         response
     }
@@ -455,16 +537,18 @@ async fn retry_new_response_if_unauthorized(
 async fn fetch_new_resource_responses(account: &Value) -> NewResourceResponses {
     let config = load_checkin_config();
     let working_account = ensure_fresh_token(account.clone(), &config).await;
-    let summary_url = new_resource_url(&working_account, RESOURCE_SUMMARY_PATH);
-    let paid_url = new_resource_url(&working_account, RESOURCE_PAID_PACKAGES_PATH);
-    let free_url = new_resource_url(&working_account, RESOURCE_FREE_PACKAGES_PATH);
+    // 路径候选按档位生成（国际版先 /billing/meter/... 再回落 /v2/billing/meter/...）。
+    let variant = variant_of(&working_account);
+    let summary_paths = variant.billing_paths(RESOURCE_SUMMARY_PATH);
+    let paid_paths = variant.billing_paths(RESOURCE_PAID_PACKAGES_PATH);
+    let free_paths = variant.billing_paths(RESOURCE_FREE_PACKAGES_PATH);
     let summary_body = json!({});
     let paid_body = paid_packages_body();
     let free_body = free_packages_body();
     let (summary, paid, free) = tokio::join!(
-        post_with_account(&working_account, &summary_url, summary_body.clone()),
-        post_with_account(&working_account, &paid_url, paid_body.clone()),
-        post_with_account(&working_account, &free_url, free_body.clone()),
+        post_with_fallback(&working_account, &summary_paths, summary_body.clone()),
+        post_with_fallback(&working_account, &paid_paths, paid_body.clone()),
+        post_with_fallback(&working_account, &free_paths, free_body.clone()),
     );
 
     if !(is_unauthorized(&summary) || is_unauthorized(&paid) || is_unauthorized(&free)) {
@@ -492,9 +576,9 @@ async fn fetch_new_resource_responses(account: &Value) -> NewResourceResponses {
     }
     let refreshed = refresh_account_token(working_account).await;
     let (summary, paid, free) = tokio::join!(
-        retry_new_response_if_unauthorized(&refreshed, summary, &summary_url, summary_body),
-        retry_new_response_if_unauthorized(&refreshed, paid, &paid_url, paid_body),
-        retry_new_response_if_unauthorized(&refreshed, free, &free_url, free_body),
+        retry_new_response_if_unauthorized(&refreshed, summary, &summary_paths, summary_body),
+        retry_new_response_if_unauthorized(&refreshed, paid, &paid_paths, paid_body),
+        retry_new_response_if_unauthorized(&refreshed, free, &free_paths, free_body),
     );
     NewResourceResponses {
         account: refreshed,
@@ -519,11 +603,13 @@ async fn fetch_legacy_user_resource(account: &Value) -> Value {
         "PackageEndTimeRangeBegin": begin,
         "PackageEndTimeRangeEnd": end,
     });
-    let url = format!("{WORKBUDDY_API_ENDPOINT}{USER_RESOURCE_PATH}");
+    // 旧接口同样按档位走候选回落（国内版只有一个候选，与改造前一致）。
+    let paths =
+        variant_of(account).billing_paths(&format!("{CHECKIN_API_PREFIX}{USER_RESOURCE_SUFFIX}"));
     // 新接口编排已经统一执行过惰性刷新，并在任一路未授权时只刷新一次。
     // 旧接口回退必须直接复用该账号，不能重新进入 authenticated_post，
     // 否则可能重复刷新并用旧 refresh token 覆盖刚落盘的新 token。
-    post_with_account(account, &url, body).await
+    post_with_fallback(account, &paths, body).await
 }
 
 fn merge_resources(summary_resources: Vec<Value>, detail_resources: Vec<Value>) -> Vec<Value> {
@@ -646,6 +732,7 @@ fn credit_result(account: &Value, resources: Vec<Value>, now: i64) -> Value {
             &account_name,
             total_capacity,
             total_remaining,
+            variant_of(account),
         );
     }
 
@@ -665,17 +752,37 @@ fn credit_result(account: &Value, resources: Vec<Value>, now: i64) -> Value {
     })
 }
 
+/// 是否走 summary/paid/free 三路新接口。
+///
+/// 三路只对国内版存在；国际版只用 `get-user-resource`（用户 2026-09-16 HAR
+/// 抓包证实），对它发三路等于 3×2 个 404，故按档位分派取数入口。
+fn uses_three_endpoint_query(variant: WbVariant) -> bool {
+    matches!(variant, WbVariant::Cn)
+}
+
 /// 查询单账号的积分资源及到期时间。
 pub async fn get_credit_expiry(account: &Value) -> Value {
-    let account_id = account.get("id").cloned().unwrap_or(Value::Null);
+    // 加密信封凭据短路：明文解不出来，任何请求都只会发出空 Bearer 并换回网关 401。
+    // 本入口同时覆盖新三路接口与旧接口回退两条取数链路，不再空跑请求。
+    if let Some(error) = envelope_token_error(account) {
+        return json!({
+            "ok": false,
+            "accountId": account.get("id").cloned().unwrap_or(Value::Null),
+            "accountName": account_display_name(account),
+            "error": error,
+        });
+    }
+
     let now = now_ms();
+
+    if !uses_three_endpoint_query(variant_of(account)) {
+        return fetch_legacy_credit(account, now).await;
+    }
+
     let responses = fetch_new_resource_responses(account).await;
-    if let Some(resources) = normalized_new_resources(
-        &responses.summary,
-        &responses.paid,
-        &responses.free,
-        now,
-    ) {
+    if let Some(resources) =
+        normalized_new_resources(&responses.summary, &responses.paid, &responses.free, now)
+    {
         return credit_result(account, resources, now);
     }
 
@@ -696,8 +803,34 @@ pub async fn get_credit_expiry(account: &Value) -> Value {
         fallback_account = refresh_account_token(fallback_account).await;
         response = fetch_legacy_user_resource(&fallback_account).await;
     }
-    if is_success(&response) && has_resource_accounts(&response) {
-        let resources = resource_accounts(&response)
+    legacy_credit_result(account, &response, now)
+}
+
+/// 单接口档位（国际版）的取数：旧接口自带完整鉴权链路。
+///
+/// 不能复用「三路已刷新账号」的前提——国际版不经过 `fetch_new_resource_responses`，
+/// 必须自己完成惰性刷新与 401 后最多一次的 token 刷新。
+async fn fetch_legacy_credit(account: &Value, now: i64) -> Value {
+    let config = load_checkin_config();
+    let mut working_account = ensure_fresh_token(account.clone(), &config).await;
+    let mut response = fetch_legacy_user_resource(&working_account).await;
+    if is_unauthorized(&response)
+        && !working_account
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+    {
+        working_account = refresh_account_token(working_account).await;
+        response = fetch_legacy_user_resource(&working_account).await;
+    }
+    legacy_credit_result(account, &response, now)
+}
+
+/// 旧接口响应 → 积分结果：成功走正常投影，失败带可读错误。
+fn legacy_credit_result(account: &Value, response: &Value, now: i64) -> Value {
+    if is_success(response) && has_resource_accounts(response) {
+        let resources = resource_accounts(response)
             .into_iter()
             .map(|resource| resource_summary(resource, now))
             .collect();
@@ -705,15 +838,46 @@ pub async fn get_credit_expiry(account: &Value) -> Value {
     }
     json!({
         "ok": false,
-        "accountId": account_id,
+        "accountId": account.get("id").cloned().unwrap_or(Value::Null),
         "accountName": account_display_name(account),
-        "error": response_error(&response),
+        "error": response_error(response),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归 issue #94：信封凭据在 authenticated_post 入口短路，不发空 Bearer，
+    /// 也不会进入刷新重试链路。
+    #[tokio::test]
+    async fn envelope_credentials_short_circuit_before_request() {
+        let account = json!({
+            "id": "envelope-only",
+            "access_token": {"$wbEncrypted": true, "envelope": "…"},
+            "refresh_token": {"$wbEncrypted": true, "envelope": "…"},
+        });
+        let resp = authenticated_post(&account, "https://example.invalid/api", json!({})).await;
+        assert_eq!(resp["code"], -2);
+        let msg = resp["message"].as_str().expect("message 应为字符串");
+        assert!(msg.contains("信封"), "错误文案应可读：{msg}");
+    }
+
+    /// 回归 issue #94 遗留：积分查询入口（新三路接口与旧接口回退的唯一入口）
+    /// 也要对加密信封凭据短路，不能空跑请求后回显网关 401 文案。
+    #[tokio::test]
+    async fn envelope_credentials_short_circuit_in_credit_query() {
+        let account = json!({
+            "id": "envelope-only",
+            "access_token": {"$wbEncrypted": true, "envelope": "…"},
+            "refresh_token": {"$wbEncrypted": true, "envelope": "…"},
+        });
+        let resp = get_credit_expiry(&account).await;
+        assert_eq!(resp["ok"], false);
+        assert_eq!(resp["accountId"], "envelope-only");
+        let msg = resp["error"].as_str().expect("error 应为字符串");
+        assert!(msg.contains("信封"), "错误文案应可读：{msg}");
+    }
 
     #[test]
     fn parses_cockpit_resource_shape_and_marks_expiry() {
@@ -934,22 +1098,40 @@ mod tests {
             "uid": "u2"
         });
         let unknown = json!({"domain": "attacker.example", "access_token": "redacted"});
+        let ai = json!({
+            "domain": "www.workbuddy.ai",
+            "variant": "ai",
+            "access_token": "redacted",
+            "uid": "u3"
+        });
 
         assert_eq!(
-            new_resource_url(&codebuddy, RESOURCE_SUMMARY_PATH),
+            format!("{}{}", api_base_for(&codebuddy), RESOURCE_SUMMARY_PATH),
             "https://www.codebuddy.cn/billing/meter/get-user-resource-summary"
         );
         assert_eq!(
-            new_resource_url(&workbuddy, RESOURCE_SUMMARY_PATH),
+            format!("{}{}", api_base_for(&workbuddy), RESOURCE_SUMMARY_PATH),
             "https://www.workbuddy.cn/billing/meter/get-user-resource-summary"
         );
         assert_eq!(
-            new_resource_url(&unknown, RESOURCE_SUMMARY_PATH),
+            format!("{}{}", api_base_for(&unknown), RESOURCE_SUMMARY_PATH),
             "https://www.codebuddy.cn/billing/meter/get-user-resource-summary"
         );
+        // 国际版固定国际版域，绝不落到国内域。
+        assert_eq!(api_base_for(&ai), WbVariant::Ai.api_endpoint());
+        assert_eq!(
+            format!("{}{}", api_base_for(&ai), RESOURCE_SUMMARY_PATH),
+            format!(
+                "{}/billing/meter/get-user-resource-summary",
+                WbVariant::Ai.api_endpoint()
+            )
+        );
 
-        let headers = resource_auth_headers(&codebuddy, new_resource_endpoint(&codebuddy));
-        assert_eq!(headers.get("X-Client-Platform").map(String::as_str), Some("web"));
+        let headers = resource_auth_headers(&codebuddy, api_base_for(&codebuddy));
+        assert_eq!(
+            headers.get("X-Client-Platform").map(String::as_str),
+            Some("web")
+        );
         assert_eq!(
             headers.get("Accept").map(String::as_str),
             Some("application/json, text/plain, */*")
@@ -972,8 +1154,22 @@ mod tests {
             Some("https://www.codebuddy.cn/profile/plans-usage")
         );
 
-        let workbuddy_headers =
-            resource_auth_headers(&workbuddy, new_resource_endpoint(&workbuddy));
+        // 国际版账号：Origin/Referer 跟随国际版域，X-Domain 仍用账号自身 domain。
+        let ai_headers = resource_auth_headers(&ai, api_base_for(&ai));
+        assert_eq!(
+            ai_headers.get("Origin").map(String::as_str),
+            Some(WbVariant::Ai.api_endpoint())
+        );
+        assert_eq!(
+            ai_headers.get("Referer").map(String::as_str),
+            Some(format!("{}/profile/plans-usage", WbVariant::Ai.api_endpoint()).as_str())
+        );
+        assert_eq!(
+            ai_headers.get("X-Domain").map(String::as_str),
+            Some("www.workbuddy.ai")
+        );
+
+        let workbuddy_headers = resource_auth_headers(&workbuddy, api_base_for(&workbuddy));
         assert_eq!(
             workbuddy_headers.get("Origin").map(String::as_str),
             Some("https://www.workbuddy.cn")
@@ -987,7 +1183,7 @@ mod tests {
             Some("www.workbuddy.cn")
         );
 
-        let unknown_headers = resource_auth_headers(&unknown, new_resource_endpoint(&unknown));
+        let unknown_headers = resource_auth_headers(&unknown, api_base_for(&unknown));
         assert_eq!(
             unknown_headers.get("Origin").map(String::as_str),
             Some("https://www.codebuddy.cn")
@@ -1015,6 +1211,91 @@ mod tests {
         );
     }
 
+    /// Origin 必须能识别第三个域；未知域仍回落国内版（既有契约）。
+    #[test]
+    fn request_origin_covers_ai_domain_and_keeps_fallback() {
+        assert_eq!(
+            request_origin(&format!(
+                "{}/billing/meter/daily-checkin",
+                WbVariant::Ai.api_endpoint()
+            )),
+            WbVariant::Ai.api_endpoint()
+        );
+        assert_eq!(
+            request_origin("https://www.workbuddy.cn/x"),
+            WORKBUDDY_WEB_ENDPOINT
+        );
+        assert_eq!(
+            request_origin("https://www.codebuddy.cn/x"),
+            WORKBUDDY_API_ENDPOINT
+        );
+        assert_eq!(request_origin("attacker://x"), WORKBUDDY_API_ENDPOINT);
+        assert_eq!(
+            request_origin("https://www.workbuddy.ai.evil.com/x"),
+            WORKBUDDY_API_ENDPOINT
+        );
+    }
+
+    /// 路径候选：国际版先 /billing/meter/... 再 /v2/billing/meter/...；国内版单候选。
+    #[test]
+    fn billing_path_candidates_by_variant() {
+        let ai = json!({"variant": "ai", "access_token": "t"});
+        let cn = json!({"access_token": "t"});
+
+        assert_eq!(
+            variant_of(&ai).billing_paths(RESOURCE_SUMMARY_PATH),
+            vec![
+                "/billing/meter/get-user-resource-summary",
+                "/v2/billing/meter/get-user-resource-summary"
+            ]
+        );
+        assert_eq!(
+            variant_of(&cn).billing_paths(RESOURCE_SUMMARY_PATH),
+            vec!["/billing/meter/get-user-resource-summary"]
+        );
+
+        let legacy = format!("{CHECKIN_API_PREFIX}{USER_RESOURCE_SUFFIX}");
+        assert_eq!(
+            variant_of(&ai).billing_paths(&legacy),
+            vec![
+                "/billing/meter/get-user-resource",
+                "/v2/billing/meter/get-user-resource"
+            ]
+        );
+        assert_eq!(
+            variant_of(&cn).billing_paths(&legacy),
+            vec!["/v2/billing/meter/get-user-resource"]
+        );
+    }
+
+    /// 只有 404 允许回落；401/10085/传输错误必须原样返回。
+    #[test]
+    fn only_route_missing_allows_fallback() {
+        assert!(is_route_missing(&json!({"code": 404})));
+        assert!(!is_route_missing(
+            &json!({"code": 401, "message": "unauthorized"})
+        ));
+        assert!(!is_route_missing(&json!({
+            "code": 10085,
+            "msg": "请求不合法，如有疑问请联系客服"
+        })));
+        assert!(!is_route_missing(
+            &json!({"code": -1, "message": "error sending request"})
+        ));
+        assert!(!is_route_missing(
+            &json!({"code": 0, "data": {"Accounts": []}})
+        ));
+
+        // 也复核「不该触发刷新」的三类：401 之外的都不刷新。
+        assert!(!is_unauthorized(&json!({
+            "code": 10085,
+            "msg": "请求不合法，如有疑问请联系客服"
+        })));
+        assert!(!is_unauthorized(
+            &json!({"code": 404, "message": "not found"})
+        ));
+    }
+
     #[test]
     fn transport_error_is_code_minus_one_with_message() {
         assert!(is_transport_error(&json!({
@@ -1028,7 +1309,9 @@ mod tests {
             "code": 10085,
             "msg": "请求不合法，如有疑问请联系客服"
         })));
-        assert!(!is_transport_error(&json!({"code": 401, "message": "unauthorized"})));
+        assert!(!is_transport_error(
+            &json!({"code": 401, "message": "unauthorized"})
+        ));
         assert!(!is_transport_error(&json!({"code": 0, "data": {}})));
         assert!(!is_unauthorized(&json!({
             "code": 10085,
@@ -1074,5 +1357,137 @@ mod tests {
             .map(|resource| resource["remaining"].as_f64().unwrap())
             .sum();
         assert_eq!(expiring, 80.0);
+    }
+
+    #[test]
+    fn prefers_cycle_end_when_deduction_end_is_a_far_placeholder() {
+        // 035：DeductionEndTime=2049 占位，CycleEndTime=月底 → 取月底
+        let now = 1_800_000_000_000_i64;
+        let cycle_end = now + 14 * 24 * 3600 * 1000;
+        let resource = resource_summary(
+            &json!({
+                "PackageCode": "TCACA_code_035_ArVxJcGDsm",
+                "CycleTotalCapacity": 100,
+                "CycleRemainCapacity": 80,
+                "DeductionEndTime": 2_049_792_688_000_i64,
+                "CycleEndTime": cycle_end,
+            }),
+            now,
+        );
+        assert_eq!(resource["expireAt"].as_i64(), Some(cycle_end));
+        assert_eq!(resource["expired"], false);
+        assert_eq!(resource["expiringSoon"], false);
+    }
+
+    #[test]
+    fn uses_deduction_end_when_only_real_expiry_is_present() {
+        // 006：只有 DeductionEndTime=14 天后 → 取 DeductionEndTime
+        let now = 1_800_000_000_000_i64;
+        let deduction_end = now + 14 * 24 * 3600 * 1000;
+        let resource = resource_summary(
+            &json!({
+                "PackageCode": "TCACA_code_006_DbXS0lrypC",
+                "CycleTotalCapacity": 250,
+                "CycleRemainCapacity": 250,
+                "DeductionEndTime": deduction_end,
+            }),
+            now,
+        );
+        assert_eq!(resource["expireAt"].as_i64(), Some(deduction_end));
+    }
+
+    #[test]
+    fn keeps_subscription_deduction_end_when_cycle_is_within_override_window() {
+        // 订阅型：两者相差 14 天 → 取 DeductionEndTime（回归保护）
+        let now = 1_800_000_000_000_i64;
+        let cycle_end = now + 16 * 24 * 3600 * 1000;
+        let deduction_end = cycle_end + 14 * 24 * 3600 * 1000;
+        let resource = resource_summary(
+            &json!({
+                "PackageCode": "TCACA_code_002_AkiJS3ZHF5",
+                "CycleCapacitySizePrecise": "500",
+                "CycleCapacityRemainPrecise": "400",
+                "DeductionEndTime": deduction_end,
+                "CycleEndTime": cycle_end,
+            }),
+            now,
+        );
+        assert_eq!(resource["expireAt"].as_i64(), Some(deduction_end));
+    }
+
+    #[test]
+    fn drops_far_future_placeholder_when_no_cycle_end() {
+        // 远期单值：只有 DeductionEndTime=2049 → expireAt 为 null
+        let now = 1_800_000_000_000_i64;
+        let resource = resource_summary(
+            &json!({
+                "PackageCode": "placeholder",
+                "CycleTotalCapacity": 100,
+                "CycleRemainCapacity": 100,
+                "DeductionEndTime": 2_049_792_688_000_i64,
+            }),
+            now,
+        );
+        assert_eq!(resource["expireAt"], Value::Null);
+        assert_eq!(resource["expired"], false);
+        assert_eq!(resource["expiringSoon"], false);
+    }
+
+    #[test]
+    fn package_code_tables_include_intl_codes() {
+        let paid: HashSet<&str> = PAID_PACKAGE_CODES.iter().copied().collect();
+        let free: HashSet<&str> = FREE_PACKAGE_CODES.iter().copied().collect();
+        for code in ["TCACA_code_003_FAnt7lcmRT", "TCACA_code_036_lupO5WgNdG"] {
+            assert!(paid.contains(code), "missing paid code {code}");
+        }
+        for code in [
+            "TCACA_code_001_PqouKr6QWV",
+            "TCACA_code_006_DbXS0lrypC",
+            "TCACA_code_035_ArVxJcGDsm",
+            "TCACA_code_037_WxOD3MpI2o",
+            "TCACA_code_039_KRcQj7wUat",
+            "TCACA_code_040_mi9rCYg46x",
+        ] {
+            assert!(free.contains(code), "missing free code {code}");
+        }
+    }
+
+    #[test]
+    fn parses_string_cycle_end_from_official_detail_payload() {
+        // 官方明细响应里 CycleEndTime 是 "YYYY-MM-DD HH:mm:ss" 字符串（035 的真实形态），
+        // 与 2049 的 DeductionEndTime 并存时取字符串周期时间。
+        let now = Local
+            .with_ymd_and_hms(2026, 9, 16, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let expected_cycle_end = Local
+            .with_ymd_and_hms(2026, 9, 30, 23, 59, 59)
+            .unwrap()
+            .timestamp_millis();
+        let resource = resource_summary(
+            &json!({
+                "PackageCode": "TCACA_code_035_ArVxJcGDsm",
+                "PackageName": "Free Plan Subscription",
+                "CapacitySize": 100,
+                "CapacityRemain": 100,
+                "CycleCapacitySize": 100,
+                "CycleCapacityRemain": 100,
+                "CycleEndTime": "2026-09-30 23:59:59",
+                "DeductionEndTime": 2_049_792_688_000_i64,
+                "ExpiredTime": "",
+            }),
+            now,
+        );
+        assert_eq!(resource["expireAt"].as_i64(), Some(expected_cycle_end));
+        assert_eq!(resource["expired"], false);
+        assert_eq!(resource["expiringSoon"], false);
+    }
+
+    #[test]
+    fn three_endpoint_query_only_for_domestic_variant() {
+        // 国际版没有 summary/paid/free 三路（官网只用 get-user-resource），
+        // 发三路等于 3×2 个 404，故只对国内版启用。
+        assert!(uses_three_endpoint_query(WbVariant::Cn));
+        assert!(!uses_three_endpoint_query(WbVariant::Ai));
     }
 }

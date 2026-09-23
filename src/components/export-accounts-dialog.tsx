@@ -148,7 +148,7 @@ export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported 
               <span className="text-muted-foreground">
                 共 {accounts.length} 个账号，已选 {selected.size} 个
               </span>
-              <button type="button" className="text-primary hover:underline" onClick={toggleAll}>
+              <button type="button" className="cursor-pointer text-primary hover:underline" onClick={toggleAll}>
                 {allSelected ? "取消全选" : "全选"}
               </button>
             </div>

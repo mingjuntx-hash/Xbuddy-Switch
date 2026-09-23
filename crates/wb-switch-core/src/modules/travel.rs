@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use crate::modules::account::{account_display_name, build_auth_headers, load_accounts};
+use crate::modules::account::{
+    self, account_display_name, build_auth_headers, load_accounts, variant_of,
+};
 use crate::modules::config::{
     http_request, load_checkin_config, load_travel_cache, load_travel_config, now_ms, now_secs,
     save_travel_cache, with_travel_cache_lock, RunFlagGuard, TRAVEL_API_PREFIX,
@@ -20,6 +22,22 @@ use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 
 static TRAVEL_RUNNING: AtomicBool = AtomicBool::new(false);
 static TRAVEL_CLAIM_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 档位不支持成长中心时的统一短路结果（design D7：国际版无派猫猫旅行）。
+///
+/// 直接返回而不发请求、不写缓存：否则后台循环会持续对国际版账号打无效请求，
+/// 并把脏数据写进 `travel_cache.json`。
+pub fn unsupported_variant_skip() -> Value {
+    json!({"status": "skipped", "reason": "unsupported_variant"})
+}
+
+/// 只保留支持成长中心（派猫猫旅行）的账号。
+fn travel_capable_accounts(accounts: Vec<Value>) -> Vec<Value> {
+    accounts
+        .into_iter()
+        .filter(|account| variant_of(account).supports_travel())
+        .collect()
+}
 
 /// 派发周期：启动即派发，之后每 30 分钟补一轮（并重试 no-buddy / 瞬时错误）。
 pub const TRAVEL_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -86,6 +104,10 @@ fn is_unauthorized(resp: &Value) -> bool {
 
 /// 发旅行接口请求；遇到未授权且存在 refresh token 时刷新一次并重试。
 async fn travel_request(path: &str, method: &str, body: Option<Value>, account: &Value) -> Value {
+    // 加密信封凭据短路：不发空 Bearer，直接给出可读错误（issue #94）。
+    if let Some(err) = account::envelope_token_error(account) {
+        return json!({"code": -2, "message": err});
+    }
     let url = format!("{WORKBUDDY_API_ENDPOINT}{path}");
     let headers = build_travel_headers(account);
     let mut resp = http_request(&url, method, body.clone(), Some(&headers)).await;
@@ -360,6 +382,10 @@ fn classify_depart_error(_code: i64, message: &str) -> DepartClass {
 
 /// 对单个账号执行派猫猫旅行：依次尝试地点列表，报错分类处理。
 pub async fn depart_travel_for_account(account: &Value) -> Value {
+    // 国际版无成长中心：不发请求、不写缓存（design D7）。
+    if !variant_of(account).supports_travel() {
+        return unsupported_variant_skip();
+    }
     let cfg = load_checkin_config();
     let acc = ensure_fresh_token(account.clone(), &cfg).await;
     let uid = acc.get("uid").and_then(Value::as_str).map(String::from);
@@ -572,14 +598,18 @@ fn merge_claim_state(prior: &Value, new: &Value) -> Value {
         if result_in_flight(prior)
             && nonzero_credit(merged.get("rewardCredit").unwrap_or(&Value::Null)).is_none()
         {
-            if let Some(credit) = nonzero_credit(prior.get("rewardCredit").unwrap_or(&Value::Null)) {
+            if let Some(credit) = nonzero_credit(prior.get("rewardCredit").unwrap_or(&Value::Null))
+            {
                 merged["rewardCredit"] = credit;
             }
         }
         if result_in_flight(prior)
             && merged.get("arriveAt").and_then(Value::as_i64).unwrap_or(0) <= 0
         {
-            if let Some(arrive_at) = prior.get("arriveAt").and_then(Value::as_i64).filter(|v| *v > 0)
+            if let Some(arrive_at) = prior
+                .get("arriveAt")
+                .and_then(Value::as_i64)
+                .filter(|v| *v > 0)
             {
                 merged["arriveAt"] = json!(arrive_at);
             }
@@ -589,7 +619,8 @@ fn merge_claim_state(prior: &Value, new: &Value) -> Value {
     if !result_claimed(prior) {
         return merged;
     }
-    let new_has_credit = nonzero_credit(merged.get("rewardCredit").unwrap_or(&Value::Null)).is_some();
+    let new_has_credit =
+        nonzero_credit(merged.get("rewardCredit").unwrap_or(&Value::Null)).is_some();
     merged["claimed"] = json!(true);
     if !new_has_credit {
         merged["rewardCredit"] = prior.get("rewardCredit").cloned().unwrap_or(Value::Null);
@@ -823,6 +854,11 @@ pub async fn run_travel_cycle() -> Value {
     if accounts.is_empty() {
         return json!({"status": "no_accounts"});
     }
+    // 档位不支持成长中心时不发请求、不写缓存（design D7）。
+    let accounts = travel_capable_accounts(accounts);
+    if accounts.is_empty() {
+        return unsupported_variant_skip();
+    }
 
     let today = today_str();
     let mut cache = load_travel_cache();
@@ -888,7 +924,7 @@ pub async fn run_travel_claim_cycle() -> Value {
         return json!({"status": "skipped", "reason": "nothing-to-claim"});
     }
 
-    let accounts = load_accounts();
+    let accounts = travel_capable_accounts(load_accounts());
     let mut claimed = 0;
     let total = ids.len();
     let mut overlay_results = Map::new();
@@ -963,7 +999,7 @@ pub async fn reconcile_due_travel(account_id: Option<&str>) {
         return;
     }
 
-    let accounts = load_accounts();
+    let accounts = travel_capable_accounts(load_accounts());
     let mut overlay_results = Map::new();
     for id in due {
         let Some(account) = accounts
@@ -990,7 +1026,16 @@ pub async fn reconcile_due_travel(account_id: Option<&str>) {
 ///
 /// label 取值：`untraveled`（未旅行）、`no-buddy`、`traveling`（旅行中）、
 /// `finished`（已结束，含官网「累了，明天再来吧」）。跨日未领的 traveling/arrived 仍显示旅行中。
+/// 档位不支持成长中心（国际版）时返回 skipped 短路结果，同时保留展示字段以避免
+/// 旧调用方解析失败。
 pub fn travel_display(account_id: &str) -> Value {
+    if account::find_account(account_id).is_some_and(|acc| !variant_of(&acc).supports_travel()) {
+        let mut skipped = unsupported_variant_skip();
+        skipped["label"] = json!("unsupported");
+        skipped["rewardCredit"] = Value::Null;
+        skipped["locationName"] = Value::Null;
+        return skipped;
+    }
     let today = today_str();
     let cache = load_travel_cache();
     let Some(r) = cache_results(&cache).and_then(|results| results.get(account_id)) else {
@@ -1009,6 +1054,21 @@ pub fn travel_display(account_id: &str) -> Value {
 mod tests {
     use super::*;
 
+    /// 回归 issue #94：信封凭据的旅行请求应在入口短路并返回可读错误，
+    /// 不发出空 Bearer。
+    #[tokio::test]
+    async fn envelope_credentials_short_circuit_before_request() {
+        let account = json!({
+            "id": "envelope-only",
+            "access_token": {"$wbEncrypted": true, "envelope": "…"},
+            "refresh_token": {"$wbEncrypted": true, "envelope": "…"},
+        });
+        let resp = travel_request("/whatever", "POST", Some(json!({})), &account).await;
+        assert_eq!(resp["code"], -2);
+        let msg = resp["message"].as_str().expect("message 应为字符串");
+        assert!(msg.contains("信封"), "错误文案应可读：{msg}");
+    }
+
     #[test]
     fn retryable_skips_are_not_terminal() {
         assert!(is_retryable_skip(Some("no-buddy")));
@@ -1025,6 +1085,41 @@ mod tests {
     fn display_defaults_to_untraveled_when_no_cache() {
         let value = travel_display("no-such-account");
         assert_eq!(value["label"], "untraveled");
+    }
+
+    /// 国际版账号：depart 直接短路，不发请求、不写缓存。
+    #[tokio::test]
+    async fn ai_account_depart_is_skipped_without_request() {
+        let ai = json!({"id": "ai-1", "uid": "u-1", "variant": "ai", "access_token": "t"});
+        let result = depart_travel_for_account(&ai).await;
+        assert_eq!(result["status"], "skipped");
+        assert_eq!(result["reason"], "unsupported_variant");
+        assert_eq!(result["ok"], Value::Null);
+
+        // 国内版账号（缺档位字段）不会走短路。
+        let cn = json!({"id": "cn-1", "uid": "u-2", "access_token": ""});
+        assert!(variant_of(&cn).supports_travel());
+    }
+
+    /// 档位过滤：国际版账号不进入旅行周期候选。
+    #[test]
+    fn travel_capable_accounts_exclude_unsupported_variants() {
+        let accounts = vec![
+            json!({"id": "cn-1"}),
+            json!({"id": "ai-1", "variant": "ai"}),
+            json!({"id": "ai-2", "domain": "www.workbuddy.ai"}),
+        ];
+        let kept = travel_capable_accounts(accounts);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["id"], "cn-1");
+    }
+
+    #[test]
+    fn unsupported_skip_shape_is_stable() {
+        assert_eq!(
+            unsupported_variant_skip(),
+            json!({"status": "skipped", "reason": "unsupported_variant"})
+        );
     }
 
     #[test]
@@ -1112,10 +1207,7 @@ mod tests {
 
     #[test]
     fn official_status_decides_whether_to_depart() {
-        assert_eq!(
-            decide_travel_action("idle", false),
-            TravelAction::Depart
-        );
+        assert_eq!(decide_travel_action("idle", false), TravelAction::Depart);
         assert_eq!(
             decide_travel_action("idle", true),
             TravelAction::SkipDailyLimit
@@ -1124,10 +1216,7 @@ mod tests {
             decide_travel_action("traveling", true),
             TravelAction::WaitTraveling
         );
-        assert_eq!(
-            decide_travel_action("arrived", true),
-            TravelAction::Claim
-        );
+        assert_eq!(decide_travel_action("arrived", true), TravelAction::Claim);
     }
 
     #[test]
@@ -1176,10 +1265,7 @@ mod tests {
         assert!(in_flight_due(&traveling, 100));
         assert!(in_flight_due(&traveling, 101));
         assert!(!in_flight_due(&traveling, 99));
-        assert!(in_flight_due(
-            &json!({ "ok": true, "claimed": false }),
-            1
-        ));
+        assert!(in_flight_due(&json!({ "ok": true, "claimed": false }), 1));
         assert!(!in_flight_due(
             &json!({ "ok": true, "claimed": true, "arriveAt": 1 }),
             100

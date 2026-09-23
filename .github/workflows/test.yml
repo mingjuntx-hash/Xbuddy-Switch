@@ -1,0 +1,53 @@
+name: test
+
+# 测试必须独立于发布流程：build.yml 仅由 tag push / workflow_dispatch 触发，
+# 测试若挂在它下面，就只在发版时执行——2026-09 的 Windows「os error 5」回归
+# 正是这样漏到 0.1.43 的。本 workflow 在 push 与 PR 上即触发。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-tests:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 三平台结果一次跑齐：任一平台失败不阻塞其余平台出结果。
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - ubuntu-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      # 与 build.yml 分开的 key 前缀（那边是 release profile 产物），
+      # restore-keys 回落到它的缓存，以复用依赖编译产物。
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-
+
+      # 只跑 core：零 tauri 依赖，不需要 webkit / npm / 前端 dist。
+      # 不传 --target，用 runner 原生 target——build.yml 的 mac-x64 是 arm runner 上
+      # 交叉编译 x86_64，跑测试需要 Rosetta，不适用于本 job。
+      - name: Run tests
+        run: cargo test -p wb-switch-core

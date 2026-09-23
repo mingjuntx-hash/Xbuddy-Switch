@@ -240,7 +240,7 @@ export function UpdateInstallDialog({
                 <div className="text-muted-foreground">下载地址（点击可手动下载）</div>
                 <button
                   type="button"
-                  className="mt-1 flex w-full items-start gap-1 break-all text-left text-primary underline-offset-2 hover:underline"
+                  className="mt-1 flex w-full cursor-pointer items-start gap-1 break-all text-left text-primary underline-offset-2 hover:underline"
                   onClick={() => void openDownload()}
                 >
                   <ExternalLink className="mt-0.5 size-3.5 shrink-0" />
@@ -263,7 +263,7 @@ export function UpdateInstallDialog({
             {downloadUrl && (
               <button
                 type="button"
-                className="flex w-full items-start gap-1 break-all text-left text-primary underline-offset-2 hover:underline"
+                className="flex w-full cursor-pointer items-start gap-1 break-all text-left text-primary underline-offset-2 hover:underline"
                 onClick={() => void openDownload()}
               >
                 <ExternalLink className="mt-0.5 size-3.5 shrink-0" />

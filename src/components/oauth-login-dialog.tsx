@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import { ExternalLink } from "lucide-react";
+import { Check, CircleAlert, Copy, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
 
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -13,23 +13,47 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import * as api from "@/lib/api";
-import type { AccountMeta } from "@/lib/types";
+import { DEFAULT_VARIANT, variantAppName, variantLabel } from "@/lib/variant";
+import type { AccountMeta, WbVariant } from "@/lib/types";
 import { useAccountsStore } from "@/stores/accounts";
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** 登录目标档位；缺省国内版（零回归）。 */
+  variant?: WbVariant;
 }
 
-/** OAuth 扫码登录采集：发起 → 打开浏览器 → 轮询采集结果 → 入库。 */
-export function OAuthLoginDialog({ open, onOpenChange }: Props) {
+/** 登录链路文案按档位区分：国内版是扫码授权，国际版只有浏览器 Web 登录授权（无二维码）。 */
+const LOGIN_COPY = {
+  cn: {
+    title: "OAuth 扫码登录",
+    // 国内版保留产品名（档位与产品同名，无歧义）；产品名仍取自 variant.ts 单一来源
+    description: `在浏览器中打开验证链接，扫码授权后将自动采集 ${variantAppName("cn")} 账号并入库。`,
+    start: "开始扫码登录",
+    waiting: "正在等待扫码授权，请在浏览器完成操作…",
+  },
+  ai: {
+    title: "OAuth Web 登录",
+    // 国际版只说档位：与账号页同口径（原来写作「WorkBuddy 国际版 账号」，
+    // 既有中英混排的冗余空格，又让同一句话里出现产品名与档位名两种叫法）
+    description: "在浏览器中打开验证链接，完成 Web 登录授权后将自动采集国际版账号并入库。",
+    start: "开始 Web 登录",
+    waiting: "请在浏览器中完成 Web 登录授权，正在等待授权结果…",
+  },
+} as const;
+
+/** OAuth 登录采集：发起 → 打开浏览器 → 轮询采集结果 → 入库。 */
+export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT }: Props) {
   const reconcileAccounts = useAccountsStore((s) => s.reconcileAccounts);
+  const copy = LOGIN_COPY[variant];
 
   const [busy, setBusy] = useState(false);
   const [loginId, setLoginId] = useState<string | null>(null);
   const [uri, setUri] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState<AccountMeta | null>(null);
+  const [copied, setCopied] = useState(false);
 
   // 打开时重置
   useEffect(() => {
@@ -39,6 +63,7 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
       setUri("");
       setError("");
       setResult(null);
+      setCopied(false);
     }
   }, [open]);
 
@@ -99,11 +124,13 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
     setBusy(true);
     setError("");
     try {
-      const res = await api.oauthStart();
+      const res = await api.oauthStart(variant);
       setLoginId(res.loginId);
       setUri(res.verificationUri);
-      // 按当前宿主能力打开验证页
-      await openInBrowser(res.verificationUri);
+      // 国内版沿用自动打开；国际版不自动跳浏览器，让用户自己复制链接到无痕窗口
+      if (variant !== "ai") {
+        await openInBrowser(res.verificationUri);
+      }
     } catch (e) {
       setError(api.asError(e));
     } finally {
@@ -111,26 +138,47 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
     }
   }
 
+  /** 复制验证链接：无痕窗口需要这条链接；失败必须如实提示，不能静默当成成功。 */
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(uri);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error("复制链接失败", {
+        description: "浏览器未授予剪贴板权限，请手动选中上方链接后复制。",
+      });
+    }
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>OAuth 扫码登录</DialogTitle>
-          <DialogDescription>
-            在浏览器中打开验证链接，扫码授权后将自动采集账号并入库。
-          </DialogDescription>
+          <DialogTitle>{copy.title}（{variantLabel(variant)}）</DialogTitle>
+          <DialogDescription>{copy.description}</DialogDescription>
         </DialogHeader>
 
         {!loginId && !result && (
-          <div className="space-y-3">
+          <div className="space-y-3 pt-2">
             <Button onClick={start} disabled={busy} className="w-full">
-              {busy ? "正在发起登录…" : "开始扫码登录"}
+              {busy ? "正在发起登录…" : copy.start}
             </Button>
           </div>
         )}
 
         {loginId && !result && (
           <div className="space-y-3">
+            {variant === "ai" && (
+              <Alert variant="warning">
+                <CircleAlert className="size-4" />
+                <AlertTitle>请把链接复制到无痕窗口打开</AlertTitle>
+                <AlertDescription>
+                  若浏览器已登录 workbuddy.ai，授权页会直接跳到「登录成功」而不会绑定账号。
+                  请用下方按钮复制链接，粘贴到浏览器的无痕（隐私）窗口中打开并完成登录。
+                </AlertDescription>
+              </Alert>
+            )}
             <Alert>
               <ExternalLink className="size-4" />
               <AlertDescription className="break-all">
@@ -138,7 +186,7 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
                   href={uri}
                   target="_blank"
                   rel="noreferrer"
-                  className="text-primary underline-offset-2 hover:underline"
+                  className="cursor-pointer text-primary underline-offset-2 hover:underline"
                   onClick={(e) => {
                     // WebUI 直接使用浏览器默认链接行为，确保即使自动弹窗被拦截
                     // 也能通过用户点击打开验证页。
@@ -151,8 +199,14 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
                 </a>
               </AlertDescription>
             </Alert>
+            {variant === "ai" && (
+              <Button variant="outline" size="sm" onClick={copyLink} className="w-full">
+                {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
+                {copied ? "已复制" : "复制链接"}
+              </Button>
+            )}
             <p className="text-sm text-muted-foreground">
-              正在等待扫码授权，请在浏览器完成操作…
+              {copy.waiting}
             </p>
           </div>
         )}
@@ -171,14 +225,11 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
           </Alert>
         )}
 
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            关闭
-          </Button>
-          {result && (
+        {result && (
+          <DialogFooter>
             <Button onClick={() => onOpenChange(false)}>完成</Button>
-          )}
-        </DialogFooter>
+          </DialogFooter>
+        )}
       </DialogContent>
     </Dialog>
   );

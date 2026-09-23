@@ -10,12 +10,13 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::modules::account::{account_display_name, load_accounts};
+use crate::modules::account::{account_display_name, load_accounts, variant_of};
 use crate::modules::config::{
     atomic_write, credit_usage_snapshots_file, load_checkin_logs, now_ms, store_dir,
     CHECKIN_LOG_KEEP_DAYS,
 };
 use crate::modules::official_usage;
+use crate::modules::variant::WbVariant;
 
 pub const CREDIT_SNAPSHOT_RETENTION_DAYS: i64 = 90;
 pub const CREDIT_SNAPSHOT_MAX_RECORDS: usize = 5_000;
@@ -31,6 +32,8 @@ struct Snapshot {
     account_name: String,
     total: f64,
     remaining: f64,
+    /// 快照所属档位；旧数据无该字段时按国内版解释（零迁移）。
+    variant: WbVariant,
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +41,8 @@ struct UsageEvent {
     ts: i64,
     date: String,
     account_id: String,
+    /// 该次消耗所属档位（取自产生下降区间的快照）。
+    variant: WbVariant,
     amount: f64,
 }
 
@@ -79,6 +84,8 @@ fn snapshot_from_value(value: &Value) -> Option<Snapshot> {
             .unwrap_or_else(|| "unknown".to_string()),
         total,
         remaining,
+        // 旧快照没有 `variant` 字段：按国内版解释（历史数据零迁移）。
+        variant: WbVariant::parse(value.get("variant").and_then(Value::as_str)),
     })
 }
 
@@ -88,6 +95,7 @@ fn snapshot_value(
     account_name: &str,
     total: f64,
     remaining: f64,
+    variant: WbVariant,
 ) -> Value {
     json!({
         "ts": ts,
@@ -95,6 +103,7 @@ fn snapshot_value(
         "accountName": account_name,
         "total": total.max(0.0),
         "remaining": remaining.max(0.0),
+        "variant": variant.as_str(),
     })
 }
 
@@ -150,7 +159,13 @@ fn normalize_snapshots(snapshots: &[Value], at_ms: i64) -> Vec<Value> {
 ///
 /// 同一账号同一资源值在短时间内只保留一条；资源值发生变化时立即保留，
 /// 这样余额下降可以归因到新快照。返回值表示本次是否实际写入。
-pub fn record_snapshot(account_id: &str, account_name: &str, total: f64, remaining: f64) -> bool {
+pub fn record_snapshot(
+    account_id: &str,
+    account_name: &str,
+    total: f64,
+    remaining: f64,
+    variant: WbVariant,
+) -> bool {
     let account_id = account_id.trim();
     if account_id.is_empty() {
         return false;
@@ -170,6 +185,7 @@ pub fn record_snapshot(account_id: &str, account_name: &str, total: f64, remaini
         account_name.trim(),
         total,
         remaining,
+        variant,
     ));
     if kept.len() > CREDIT_SNAPSHOT_MAX_RECORDS {
         kept.drain(..kept.len() - CREDIT_SNAPSHOT_MAX_RECORDS);
@@ -259,8 +275,10 @@ fn usage_in_windows(date: &str, today: NaiveDate) -> (bool, bool, bool) {
 fn add_account_name(
     account_ids: &mut Vec<String>,
     account_names: &mut HashMap<String, String>,
+    account_variants: &mut HashMap<String, WbVariant>,
     account_id: String,
     account_name: String,
+    variant: WbVariant,
 ) {
     if !account_ids.contains(&account_id) {
         account_ids.push(account_id.clone());
@@ -270,8 +288,17 @@ fn add_account_name(
         .map(|name| name == "unknown" && account_name != "unknown")
         .unwrap_or(true);
     if should_replace {
-        account_names.insert(account_id, account_name);
+        account_names.insert(account_id.clone(), account_name);
     }
+    // 档位一旦确定为国际版就不再被旧快照的默认值覆盖。
+    account_variants
+        .entry(account_id)
+        .and_modify(|existing| {
+            if *existing == WbVariant::Cn && variant == WbVariant::Ai {
+                *existing = variant;
+            }
+        })
+        .or_insert(variant);
 }
 
 fn checkin_identity(event: &CheckinEvent) -> Option<String> {
@@ -299,6 +326,8 @@ fn build_statistics(
     let mut account_ids = Vec::new();
     let mut current_account_ids = Vec::new();
     let mut account_names = HashMap::new();
+    // 账号行带档位便于区分（国际版/国内版账号可能同名）。
+    let mut account_variants: HashMap<String, WbVariant> = HashMap::new();
     for account in accounts {
         if let Some(id) = non_empty_string(account.get("id")) {
             if !current_account_ids.contains(&id) {
@@ -307,8 +336,10 @@ fn build_statistics(
             add_account_name(
                 &mut account_ids,
                 &mut account_names,
+                &mut account_variants,
                 id,
                 account_display_name(account),
+                variant_of(account),
             );
         }
     }
@@ -316,17 +347,25 @@ fn build_statistics(
         add_account_name(
             &mut account_ids,
             &mut account_names,
+            &mut account_variants,
             snapshot.account_id.clone(),
             snapshot.account_name.clone(),
+            snapshot.variant,
         );
     }
     for event in &checkins {
         if let Some(account_id) = &event.account_id {
+            let variant = account_variants
+                .get(account_id)
+                .copied()
+                .unwrap_or(WbVariant::Cn);
             add_account_name(
                 &mut account_ids,
                 &mut account_names,
+                &mut account_variants,
                 account_id.clone(),
                 event.account_name.clone(),
+                variant,
             );
         }
     }
@@ -382,6 +421,7 @@ fn build_statistics(
                 ts: current.ts,
                 date,
                 account_id: account_id.clone(),
+                variant: current.variant,
                 amount,
             });
         }
@@ -467,6 +507,11 @@ fn build_statistics(
             json!({
                 "accountId": account_id,
                 "accountName": account_names.get(account_id).cloned().unwrap_or_else(|| "unknown".to_string()),
+                "variant": account_variants
+                    .get(account_id)
+                    .copied()
+                    .unwrap_or(WbVariant::Cn)
+                    .as_str(),
                 "isCurrent": is_current,
                 "currentRemaining": is_current.then(|| latest.map(|snapshot| snapshot.remaining)).flatten(),
                 "totalCapacity": is_current.then(|| latest.map(|snapshot| snapshot.total)).flatten(),
@@ -506,6 +551,7 @@ fn build_statistics(
                     "date": event.date,
                     "accountId": event.account_id,
                     "accountName": account_names.get(&event.account_id).cloned().unwrap_or_else(|| "unknown".to_string()),
+                    "variant": event.variant.as_str(),
                     "amount": event.amount,
                 }),
             )
@@ -520,6 +566,13 @@ fn build_statistics(
                 "date": event.date,
                 "accountId": event.account_id,
                 "accountName": event.account_id.as_ref().and_then(|id| account_names.get(id)).cloned().unwrap_or_else(|| event.account_name.clone()),
+                "variant": event
+                    .account_id
+                    .as_ref()
+                    .and_then(|id| account_variants.get(id))
+                    .copied()
+                    .unwrap_or(WbVariant::Cn)
+                    .as_str(),
                 "result": event.result,
                 "error": event.error,
             }),
@@ -581,7 +634,117 @@ mod tests {
     }
 
     fn snap(ts: i64, remaining: f64) -> Value {
-        snapshot_value(ts, "account-1", "one@example.com", 100.0, remaining)
+        snapshot_value(
+            ts,
+            "account-1",
+            "one@example.com",
+            100.0,
+            remaining,
+            WbVariant::Cn,
+        )
+    }
+
+    fn snap_variant(ts: i64, remaining: f64, variant: WbVariant) -> Value {
+        snapshot_value(
+            ts,
+            "account-1",
+            "one@example.com",
+            100.0,
+            remaining,
+            variant,
+        )
+    }
+
+    /// 旧快照没有 `variant` 字段：按国内版解释，且统计行显式带档位。
+    #[test]
+    fn legacy_snapshots_without_variant_are_read_as_cn() {
+        let legacy = json!({
+            "ts": at_local_date(0, 12),
+            "accountId": "account-1",
+            "accountName": "one@example.com",
+            "total": 100.0,
+            "remaining": 90.0,
+        });
+        assert!(legacy.get("variant").is_none());
+        let parsed = snapshot_from_value(&legacy).expect("旧快照仍可解析");
+        assert_eq!(parsed.variant, WbVariant::Cn);
+
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(
+            &[
+                json!({
+                    "ts": now - 60_000,
+                    "accountId": "account-1",
+                    "accountName": "one@example.com",
+                    "total": 100.0,
+                    "remaining": 100.0,
+                }),
+                legacy,
+            ],
+            &[],
+            &[],
+            now,
+        );
+        assert_eq!(stats["summary"]["usageToday"], 10.0);
+        assert_eq!(stats["accounts"][0]["variant"], "cn");
+        assert_eq!(stats["events"][0]["variant"], "cn");
+    }
+
+    /// 新快照带档位：账号行与事件都能区分国内版/国际版。
+    #[test]
+    fn snapshots_and_events_carry_variant() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(
+            &[
+                snap_variant(now - 60_000, 100.0, WbVariant::Ai),
+                snap_variant(now, 80.0, WbVariant::Ai),
+            ],
+            &[],
+            &[json!({"id": "account-1", "variant": "ai", "email": "one@example.com"})],
+            now,
+        );
+
+        assert_eq!(stats["summary"]["usageToday"], 20.0);
+        let account = stats["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["accountId"] == "account-1")
+            .expect("account row");
+        assert_eq!(account["variant"], "ai");
+        assert_eq!(stats["events"][0]["kind"], "usage");
+        assert_eq!(stats["events"][0]["variant"], "ai");
+    }
+
+    /// 账号库里的档位优先于旧快照的默认国内版解释。
+    #[test]
+    fn account_variant_wins_over_legacy_snapshot_default() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(
+            &[json!({
+                "ts": now,
+                "accountId": "ai-1",
+                "accountName": "ai@example.com",
+                "total": 10.0,
+                "remaining": 10.0,
+            })],
+            &[json!({
+                "ts": now,
+                "accountId": "ai-1",
+                "email": "ai@example.com",
+                "result": "success",
+            })],
+            &[json!({"id": "ai-1", "variant": "ai"})],
+            now,
+        );
+        let account = stats["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["accountId"] == "ai-1")
+            .expect("account row");
+        assert_eq!(account["variant"], "ai");
+        assert_eq!(stats["events"][0]["variant"], "ai");
     }
 
     #[test]

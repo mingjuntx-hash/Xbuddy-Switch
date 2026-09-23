@@ -1,8 +1,13 @@
 //! WorkBuddy 官方请求用量投影。
 //!
-//! 这里负责请求最近 31 个自然日、处理分页、校验和归一化明细，并只向上层
+//! 这里负责请求最近 31 个自然日、连续扫描明细、校验和归一化，并只向上层
 //! 暴露统计字段与有限的请求摘要。投影会写入本地缓存，避免每次打开统计页
 //! 都打官方用量接口；上游可能携带的 prompt/input 等字段永远不会被复制。
+//!
+//! 取数方式受服务端限制：单次查询最多返回 [`OFFICIAL_USAGE_PAGE_SIZE`] 条，
+//! 超过时**保留区间内最早的一批**（`total` 也一起被截断成同一数字），翻页
+//! 拿不到更新的记录。因此这里不靠 `total` 判断是否取完，而是「取满即把起点
+//! 推进到本轮最新一条的时间戳」反复扫描，直到某一轮取不满为止。
 
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, TimeZone};
 use serde_json::{json, Map, Value};
@@ -11,15 +16,31 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use crate::modules::account::{account_display_name, get_str};
+use crate::modules::account::{account_display_name, get_str, variant_of};
 use crate::modules::config::{atomic_write, official_usage_cache_file, store_dir};
 use crate::modules::credits::authenticated_post;
+use crate::modules::variant::WbVariant;
 
 pub const OFFICIAL_USAGE_URL: &str =
     "https://www.workbuddy.cn/billing/meter/get-user-request-usage";
+/// 国际版同构接口（实测存在），形态与 `credits` 的国际版 billing 路径一致，无 `/v2` 前缀。
+pub const AI_OFFICIAL_USAGE_URL: &str =
+    "https://www.workbuddy.ai/billing/meter/get-user-request-usage";
+
+/// 按账号档位选择官方用量接口 URL，这是唯一的档位分派点。
+/// 绝不跨档位请求：国际版 token 不打国内域，国内版 token 也不打国际域
+/// （会污染统计并触发网关一致性校验失败）。
+fn official_usage_url_for(account: &Value) -> &'static str {
+    match variant_of(account) {
+        WbVariant::Cn => OFFICIAL_USAGE_URL,
+        WbVariant::Ai => AI_OFFICIAL_USAGE_URL,
+    }
+}
 pub const OFFICIAL_USAGE_PAGE_SIZE: usize = 3_000;
 pub const OFFICIAL_USAGE_DETAIL_LIMIT: usize = 100;
-const OFFICIAL_USAGE_MAX_PAGES: usize = 100;
+/// 连续扫描的轮数上限：每轮最多 [`OFFICIAL_USAGE_PAGE_SIZE`] 条，100 轮足够覆盖
+/// 单账号单窗口的任何真实量级，同时兜住「服务端异常回同样一页」的死循环。
+const OFFICIAL_USAGE_MAX_ROUNDS: usize = 100;
 static OFFICIAL_USAGE_MEMORY: Mutex<Option<Value>> = Mutex::new(None);
 
 fn official_usage_fetch_lock() -> &'static tokio::sync::Mutex<()> {
@@ -222,7 +243,7 @@ struct RequestRow {
 
 #[derive(Clone, Debug)]
 struct OfficialPage {
-    total: usize,
+    /// 服务端实际返回的条数（含未通过归一化的记录），用于判断本页是否取满。
     raw_len: usize,
     rows: Vec<RequestRow>,
 }
@@ -373,31 +394,66 @@ fn parse_page(response: &Value) -> Result<OfficialPage, String> {
     let Some(raw_rows) = data.get("data").and_then(Value::as_array) else {
         return Err("官方响应格式无效".to_string());
     };
-    let total = data
-        .get("total")
-        .and_then(|value| {
-            value.as_u64().or_else(|| {
-                value
-                    .as_str()
-                    .and_then(|text| text.trim().parse::<u64>().ok())
-            })
-        })
-        .unwrap_or(raw_rows.len() as u64)
-        .min(usize::MAX as u64) as usize;
+    // `data.total` 会被服务端一起截断（31 天窗口固定回报 3000），不能当总数用。
     Ok(OfficialPage {
-        total,
         raw_len: raw_rows.len(),
         rows: raw_rows.iter().filter_map(normalize_row).collect(),
     })
 }
 
-fn should_fetch_next_page(
-    page_number: usize,
-    total: usize,
-    fetched_raw: usize,
+/// 本轮之后如何继续扫描。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SweepDecision {
+    /// 本轮没取满：窗口内的记录已经取完。
+    Complete,
+    /// 本轮取满：从该时间戳（含）继续向后取。
+    Continue(i64),
+    /// 本轮取满但起点无法推进（记录挤在同一时间点）：停止并保留已取到的数据。
+    Stalled,
+}
+
+fn decide_sweep(
     page_len: usize,
-) -> bool {
-    page_len > 0 && fetched_raw < total && page_number < OFFICIAL_USAGE_MAX_PAGES
+    newest_ts: Option<i64>,
+    previous_newest: Option<i64>,
+) -> SweepDecision {
+    if page_len < OFFICIAL_USAGE_PAGE_SIZE {
+        return SweepDecision::Complete;
+    }
+    let Some(newest_ts) = newest_ts else {
+        return SweepDecision::Stalled;
+    };
+    match previous_newest {
+        Some(previous) if newest_ts <= previous => SweepDecision::Stalled,
+        _ => SweepDecision::Continue(newest_ts),
+    }
+}
+
+/// 下一轮起点（含边界那条，靠去重去掉重复），格式对齐接口要求。
+fn start_time_at(ts: i64) -> Option<String> {
+    Local
+        .timestamp_millis_opt(ts)
+        .single()
+        .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+/// 合并一轮结果：只保留窗口内的记录，并按 (requestId, requestTime) 去重。
+/// 相邻两轮在边界时间戳上必然重复，去重是连续扫描正确性的前提。
+fn merge_rows(
+    rows: &mut Vec<RequestRow>,
+    seen_request_ids: &mut HashSet<(String, i64)>,
+    incoming: Vec<RequestRow>,
+    range_start: NaiveDate,
+    range_end: NaiveDate,
+) {
+    for row in incoming
+        .into_iter()
+        .filter(|row| row.date >= range_start && row.date <= range_end)
+    {
+        if seen_request_ids.insert((row.request_id.clone(), row.request_ts)) {
+            rows.push(row);
+        }
+    }
 }
 
 fn local_date_at(ts: i64) -> NaiveDate {
@@ -413,55 +469,64 @@ async fn fetch_account_usage(
     range_start: NaiveDate,
     range_end: NaiveDate,
 ) -> Result<AccountFetch, String> {
-    let start_time = format!("{range_start} 00:00:00");
+    let url = official_usage_url_for(account);
     let end_time = format!("{range_end} 23:59:59");
-    let mut page_number = 1;
+    let mut start_time = format!("{range_start} 00:00:00");
+    let mut rounds = 0usize;
     let mut fetched_raw = 0;
-    let mut reported_total = 0;
     let mut rows = Vec::new();
     let mut seen_request_ids = HashSet::new();
+    let mut previous_newest: Option<i64> = None;
 
     loop {
         let response = authenticated_post(
             account,
-            OFFICIAL_USAGE_URL,
+            url,
             json!({
                 "startTime": start_time,
                 "endTime": end_time,
-                "pageNum": page_number,
+                "pageNum": 1,
                 "pageSize": OFFICIAL_USAGE_PAGE_SIZE,
             }),
         )
         .await;
         let page = parse_page(&response)?;
-        reported_total = reported_total.max(page.total);
         fetched_raw += page.raw_len;
-        for row in page
-            .rows
-            .into_iter()
-            .filter(|row| row.date >= range_start && row.date <= range_end)
-        {
-            if seen_request_ids.insert((row.request_id.clone(), row.request_ts)) {
-                rows.push(row);
-            }
-        }
+        let newest_ts = page.rows.iter().map(|row| row.request_ts).max();
+        merge_rows(
+            &mut rows,
+            &mut seen_request_ids,
+            page.rows,
+            range_start,
+            range_end,
+        );
 
-        if !should_fetch_next_page(page_number, reported_total, fetched_raw, page.raw_len) {
-            if page.raw_len == 0 && fetched_raw < reported_total {
-                return Err("官方用量分页数据不完整".to_string());
+        match decide_sweep(page.raw_len, newest_ts, previous_newest) {
+            SweepDecision::Complete => break,
+            SweepDecision::Stalled => {
+                eprintln!(
+                    "[官方用量] 取数起点无法继续推进，已保留 {} 条记录",
+                    rows.len()
+                );
+                break;
             }
-            if page_number >= OFFICIAL_USAGE_MAX_PAGES && fetched_raw < reported_total {
-                return Err("官方用量分页超过安全上限".to_string());
+            SweepDecision::Continue(newest_ts) => {
+                rounds += 1;
+                if rounds >= OFFICIAL_USAGE_MAX_ROUNDS {
+                    return Err("官方用量分页超过安全上限".to_string());
+                }
+                start_time =
+                    start_time_at(newest_ts).ok_or_else(|| "官方用量分页时间无效".to_string())?;
+                previous_newest = Some(newest_ts);
             }
-            break;
         }
-        page_number += 1;
     }
 
     Ok(AccountFetch {
-        rows,
-        reported_total,
+        // 服务端的 total 不可信，这里回报窗口内实际取回并去重后的条数。
+        reported_total: rows.len(),
         fetched_raw,
+        rows,
     })
 }
 
@@ -768,8 +833,8 @@ mod tests {
         }))
         .expect("valid official page");
 
-        assert_eq!(page.total, 1);
         assert_eq!(page.raw_len, 1);
+        assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].credit, 1.25);
         let output = request_value("account-1", "one@example.com", &page.rows[0]);
         let text = output.to_string();
@@ -779,11 +844,11 @@ mod tests {
     }
 
     #[test]
-    fn malformed_rows_are_ignored_without_turning_into_zero_usage() {
+    fn parse_page_keeps_row_count_without_trusting_capped_total() {
         let page = parse_page(&json!({
-            "code": 200,
+            "code": 0,
             "data": {
-                "total": 3,
+                "total": "3000",
                 "data": [
                     {"requestId": "valid", "credit": 2, "requestTime": "2026-08-24 12:00:00"},
                     {"requestId": "negative", "credit": -1, "requestTime": "2026-08-24 12:00:00"},
@@ -791,35 +856,64 @@ mod tests {
                 ]
             }
         }))
-        .expect("page shape is valid");
+        .expect("valid official page");
 
+        // 原始条数用于判断「本页是否取满」，其中无法解析的记录不能当作 0 计入。
         assert_eq!(page.raw_len, 3);
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].credit, 2.0);
     }
 
+    /// 连续扫描：只有「取满」才继续，且起点必须严格前进，否则会空转。
     #[test]
-    fn pagination_stops_on_empty_short_total_and_page_limit() {
-        assert!(!should_fetch_next_page(1, 10, 0, 0));
-        assert!(should_fetch_next_page(1, 10, 2, 2));
-        assert!(!should_fetch_next_page(
-            1,
-            2_000,
-            2_000,
-            OFFICIAL_USAGE_PAGE_SIZE
-        ));
-        assert!(should_fetch_next_page(
-            1,
-            6_000,
-            OFFICIAL_USAGE_PAGE_SIZE,
-            OFFICIAL_USAGE_PAGE_SIZE
-        ));
-        assert!(!should_fetch_next_page(
-            OFFICIAL_USAGE_MAX_PAGES,
-            usize::MAX,
-            OFFICIAL_USAGE_PAGE_SIZE * OFFICIAL_USAGE_MAX_PAGES,
-            OFFICIAL_USAGE_PAGE_SIZE,
-        ));
+    fn sweep_decision_only_advances_on_full_pages() {
+        assert_eq!(decide_sweep(0, None, None), SweepDecision::Complete);
+        assert_eq!(
+            decide_sweep(OFFICIAL_USAGE_PAGE_SIZE - 1, Some(100), None),
+            SweepDecision::Complete
+        );
+        assert_eq!(
+            decide_sweep(OFFICIAL_USAGE_PAGE_SIZE, Some(100), None),
+            SweepDecision::Continue(100)
+        );
+        assert_eq!(
+            decide_sweep(OFFICIAL_USAGE_PAGE_SIZE, Some(200), Some(100)),
+            SweepDecision::Continue(200)
+        );
+        // 取满但时间戳没有前进：记录挤在同一时间点，只能停下
+        assert_eq!(
+            decide_sweep(OFFICIAL_USAGE_PAGE_SIZE, Some(100), Some(100)),
+            SweepDecision::Stalled
+        );
+        assert_eq!(
+            decide_sweep(OFFICIAL_USAGE_PAGE_SIZE, None, Some(100)),
+            SweepDecision::Stalled
+        );
+    }
+
+    /// 相邻两轮的边界记录（同一 requestId + 时间戳）只算一次，窗口外的记录被丢弃。
+    #[test]
+    fn merged_rounds_dedupe_boundary_rows() {
+        let (today, today_ts) = local_date(0, 12);
+        let (yesterday, _) = local_date(1, 12);
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+
+        let boundary = row(today, today_ts, 1.0);
+        merge_rows(
+            &mut rows,
+            &mut seen,
+            vec![boundary.clone()],
+            yesterday,
+            today,
+        );
+        merge_rows(&mut rows, &mut seen, vec![boundary], yesterday, today);
+        assert_eq!(rows.len(), 1);
+
+        let mut out_of_window = row(today - Duration::days(30), today_ts, 5.0);
+        out_of_window.request_id = "request-2".to_string();
+        merge_rows(&mut rows, &mut seen, vec![out_of_window], yesterday, today);
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
@@ -837,13 +931,12 @@ mod tests {
         assert_eq!(today_usage, 1.5);
         assert_eq!(week_usage, 3.5);
         // 月初时“昨天”可能属于上月（甚至跨年），此时本月仅包含今天这条。
-        let expected_month_usage = if yesterday.year() == today.year()
-            && yesterday.month() == today.month()
-        {
-            3.5
-        } else {
-            1.5
-        };
+        let expected_month_usage =
+            if yesterday.year() == today.year() && yesterday.month() == today.month() {
+                3.5
+            } else {
+                1.5
+            };
         assert_eq!(month_usage, expected_month_usage);
         assert_eq!(daily[&today], 1.5);
         assert_eq!(daily[&yesterday], 2.0);
@@ -945,5 +1038,26 @@ mod tests {
         assert!(parse_official_usage_cache("not-json").is_none());
         assert!(parse_official_usage_cache("{}").is_none());
         assert!(parse_official_usage_cache(r#"{"payload":{"status":"nope"}}"#).is_none());
+    }
+
+    /// 档位分派：两档各走自己的域，绝不跨档位。
+    #[test]
+    fn official_usage_url_follows_account_variant() {
+        assert_eq!(
+            official_usage_url_for(&json!({"uid": "u-1"})),
+            OFFICIAL_USAGE_URL
+        );
+        assert_eq!(
+            official_usage_url_for(&json!({"uid": "u-1", "variant": "cn"})),
+            OFFICIAL_USAGE_URL
+        );
+        assert_eq!(
+            official_usage_url_for(&json!({"uid": "u-2", "variant": "ai"})),
+            AI_OFFICIAL_USAGE_URL
+        );
+        assert_eq!(
+            official_usage_url_for(&json!({"uid": "u-3", "domain": "www.workbuddy.ai"})),
+            AI_OFFICIAL_USAGE_URL
+        );
     }
 }

@@ -6,6 +6,7 @@ mod instance_lock;
 mod tray;
 
 use std::time::Duration;
+use tauri::Emitter;
 use wb_switch_core::modules;
 
 const SCREENSHOT_DEMO_ENV: &str = "WB_SWITCH_SCREENSHOT_DEMO";
@@ -14,8 +15,31 @@ pub(crate) fn is_screenshot_demo() -> bool {
     std::env::var(SCREENSHOT_DEMO_ENV).as_deref() == Ok("1")
 }
 
-/// 后台循环：自动签到启动即核验、每 30 分钟补签；自动轮换每 30 秒检查；每天一次保活。
-fn spawn_background_loops() {
+/// 轮换推迟提示：桌面端先向前端推 `rotate-deferred`（应用内提示，窗口开着就能看到），
+/// 再尽力投递系统通知（应用在托盘/后台时可见）。
+///
+/// 应用内提示不依赖系统通知权限：插件在开发态会把通知登记到「终端」名下，且投递失败
+/// 无法观测（`show()` 恒返回 Ok），所以两者都发、以前者为准。
+/// 其它形态由 core 的日志与 `notify` 返回字段承载，宿主不投递。
+pub(crate) fn deliver_rotate_notify(app: &tauri::AppHandle, result: &serde_json::Value) {
+    #[cfg(desktop)]
+    {
+        if let Some(notify) = result.get("notify") {
+            let _ = app.emit("rotate-deferred", notify.clone());
+            tray::notify_rotate_deferred(app, notify);
+        }
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (app, result);
+    }
+}
+
+/// 后台循环：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
+/// 签到时间段时固定 30 分钟）；自动轮换每 30 秒检查；每天一次保活；
+/// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
+fn spawn_background_loops(app: tauri::AppHandle) {
+    let rotate_app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(error) = modules::config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");
@@ -24,7 +48,7 @@ fn spawn_background_loops() {
             modules::checkin::run_checkin_cycle(modules::checkin::CheckinCycleMode::StartupVerify)
                 .await;
         loop {
-            tokio::time::sleep(modules::checkin::CHECKIN_RECOVERY_INTERVAL).await;
+            tokio::time::sleep(modules::checkin::next_cycle_delay()).await;
             let _ = modules::checkin::run_checkin_cycle(
                 modules::checkin::CheckinCycleMode::PeriodicRecovery,
             )
@@ -33,6 +57,7 @@ fn spawn_background_loops() {
     });
 
     // 派猫猫旅行：启动即派发，之后周期性补派（并重试 no-buddy / 瞬时错误）。
+    // 档位过滤在 core（`travel_capable_accounts`）：不支持成长中心的档位不会发请求。
     tauri::async_runtime::spawn(async move {
         let _ = modules::travel::run_travel_cycle().await;
         loop {
@@ -65,7 +90,8 @@ fn spawn_background_loops() {
                 let now = modules::config::now_ms();
                 if now - last_rotate_at >= interval_minutes * 60_000 {
                     last_rotate_at = now;
-                    let _ = modules::rotate::run_rotate_cycle().await;
+                    let result = modules::rotate::run_rotate_cycle().await;
+                    deliver_rotate_notify(&rotate_app, &result);
                 }
             }
             let today = modules::checkin::date_str(None);
@@ -74,6 +100,22 @@ fn spawn_background_loops() {
                 let _ = modules::refresh::run_keepalive_cycle().await;
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+
+    // 限额 hook 信号：轮询 `~/.wb-switch/hook-events.jsonl`（CLI / WorkBuddy 的 429 当轮
+    // 由客户端 hook 追加），入账后通知前端立即拉取。轻量模式下窗口销毁但进程仍在，
+    // 状态由后端持有（见 `rate_limit_events.rs`）。
+    modules::rate_limit_events::spawn_watcher(move || {
+        let _ = app.emit("rate-limits-updated", serde_json::json!({}));
+    });
+
+    // 默认接入：后台线程自动安装 hook（幂等、非阻塞、失败静默）。
+    // 前置条件（开关开启 / 用户没卸载过 / 存在客户端 / 未装全）由 core 判定；
+    // 装上了就作废扫描缓存——扫描范围从全量收窄到「未注册的来源」。
+    std::thread::spawn(|| {
+        if modules::rate_limit_hook::auto_install_on_startup() {
+            modules::limits::invalidate_scan_cache();
         }
     });
 }
@@ -127,7 +169,7 @@ pub fn run() {
             }
             // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
             if !is_screenshot_demo() {
-                spawn_background_loops();
+                spawn_background_loops(app.handle().clone());
             }
             Ok(())
         })
@@ -140,6 +182,14 @@ pub fn run() {
             commands::get_codebuddy_cn_ide_status,
             commands::switch_codebuddy_cn_ide_account,
             commands::detect_codebuddy_cn_ide_account,
+            commands::get_vscode_ext_status,
+            commands::switch_vscode_ext_account,
+            commands::detect_vscode_ext_account,
+            commands::list_vscode_sessions,
+            commands::vscode_session_links_preview,
+            commands::get_codebuddy_ide_status,
+            commands::switch_codebuddy_ide_account,
+            commands::detect_codebuddy_ide_account,
             commands::delete_account,
             commands::oauth_start,
             commands::oauth_status,
@@ -151,6 +201,7 @@ pub fn run() {
             commands::switch_account,
             commands::list_sessions,
             commands::copy_sessions,
+            commands::session_links_preview,
             commands::open_permission_settings,
             commands::check_auth_permission,
             commands::reveal_app_in_finder,
@@ -158,6 +209,12 @@ pub fn run() {
             commands::get_credit_expiry,
             commands::get_credit_statistics,
             commands::get_token_statistics,
+            commands::get_rate_limits,
+            commands::get_rate_limit_hook_status,
+            commands::install_rate_limit_hook,
+            commands::uninstall_rate_limit_hook,
+            commands::get_rate_limit_config,
+            commands::save_rate_limit_config,
             commands::checkin,
             commands::checkin_all,
             commands::get_auto_checkin_config,
@@ -190,6 +247,9 @@ pub fn run() {
             commands::relaunch_app,
             commands::get_launch_at_login_enabled,
             commands::set_launch_at_login_enabled,
+            commands::record_notification,
+            commands::list_notifications,
+            commands::clear_notifications,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

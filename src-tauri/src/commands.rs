@@ -8,8 +8,10 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits, export_import, oauth,
-    process, refresh, rotate, session, switch, token_stats, travel, update,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, credit_usage,
+    credits, export_import, limits, notifications, oauth, process, rate_limit_events,
+    rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
+    variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
 
 #[derive(Serialize)]
@@ -19,41 +21,50 @@ pub struct AppStatus {
     current: Option<Value>,
     app_path: String,
     version: String,
+    variant: String,
 }
 
 /// GET /api/status —— WorkBuddy 运行状态 + 当前账号。
+///
+/// `variant` 缺省国内版：不传参数时行为与改造前逐字一致（只多返回 `variant` 字段）。
 #[tauri::command]
-pub async fn get_status() -> Result<AppStatus, String> {
+pub async fn get_status(variant: Option<String>) -> Result<AppStatus, String> {
+    let variant = WbVariant::parse(variant.as_deref());
     // Windows 的运行状态检测会启动 tasklist 子进程。同步 command 默认在
     // Tauri 主线程执行，标题栏拖拽期间一旦焦点事件触发状态刷新，就会阻塞
     // 原生窗口消息循环。放入 blocking 线程，保持窗口移动与 IPC 查询解耦。
-    tauri::async_runtime::spawn_blocking(build_app_status)
+    tauri::async_runtime::spawn_blocking(move || build_app_status(variant))
         .await
         .map_err(|error| format!("查询应用状态失败: {error}"))
 }
 
-fn build_app_status() -> AppStatus {
-    let auth = auth_file::read_auth_file();
+fn build_app_status(variant: WbVariant) -> AppStatus {
+    let auth = auth_file::read_auth_file(variant);
     let current = auth.as_ref().and_then(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
         Some(json!({
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "email": acct.get("email"),
+            "uid": account::display_value(&acct, "uid"),
+            "nickname": account::display_value(&acct, "nickname"),
+            "email": account::display_value(&acct, "email"),
         }))
     });
     AppStatus {
-        running: process::is_workbuddy_running(),
-        auth_file: auth_file::auth_file_path().to_string_lossy().to_string(),
+        running: process::is_workbuddy_running(variant),
+        auth_file: auth_file::auth_file_path(variant)
+            .to_string_lossy()
+            .to_string(),
         current,
-        app_path: auth_file::workbuddy_app_path()
+        app_path: auth_file::workbuddy_app_path(variant)
             .to_string_lossy()
             .to_string(),
         version: update::APP_VERSION.to_string(),
+        variant: variant.as_str().to_string(),
     }
 }
 
 /// GET /api/accounts —— 账号列表（account_meta，不含 token）。
+///
+/// 返回全部档位的账号；每行 meta 自带 `variant`，由前端按当前档位过滤。
 #[tauri::command]
 pub fn get_accounts() -> Value {
     let metas: Vec<Value> = account::load_accounts()
@@ -84,14 +95,23 @@ pub async fn install_codebuddy_cli_helper() -> Result<Value, String> {
 
 /// POST /api/codebuddy-cli/switch —— 只切换 CodeBuddy CLI，不重启 WorkBuddy。
 ///
+/// 任何切换都会**先关闭正在运行的 CodeBuddy CLI 再写状态**：key 是进程级快照，
+/// 不关进程就会出现"新默认账号 + 旧进程仍持旧 key"的窗口。当前 CLI 会话因此会中断。
+///
+/// `close_running_cli` 入参**已废弃**（保留接受但忽略），仅为不破坏既有调用方。
+///
 /// async + spawn_blocking：切换会用登录 shell 定位 node 并执行 apiKeyHelper
 /// 校验账号（子进程无超时），同步 command 会阻塞主线程造成 UI 卡顿。
 #[tauri::command(rename_all = "camelCase")]
-pub async fn switch_codebuddy_cli_account(account_id: String) -> Result<Value, String> {
+pub async fn switch_codebuddy_cli_account(
+    account_id: String,
+    close_running_cli: Option<bool>,
+) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
-    tauri::async_runtime::spawn_blocking(move || codebuddy_cli::set_active_account(&account_id))
+    let _ = close_running_cli;
+    tauri::async_runtime::spawn_blocking(move || codebuddy_cli::switch_active_account(&account_id))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -136,6 +156,128 @@ pub async fn detect_codebuddy_cn_ide_account() -> Result<Value, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// GET /api/vscode-ext/status —— VS Code CodeBuddy 扩展安装/运行/当前账号。
+///
+/// async + spawn_blocking：状态检测会跑 tasklist/ps 等子进程，账号页每次挂载都会
+/// 刷新，若在主线程执行会造成页面卡顿。
+#[tauri::command]
+pub async fn get_vscode_ext_status() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(vscode_ext::status)
+        .await
+        .map_err(|error| format!("查询 VS Code CodeBuddy 插件状态失败: {error}"))
+}
+
+/// GET /api/vscode-ext/sessions —— 列出当前 VS Code 扩展账号可复制的会话。
+///
+/// async + spawn_blocking：会扫描扩展数据目录（可能较大）并读取本地状态文件，
+/// 避免阻塞主线程。未登录/未安装时返回空列表而非报错（供前端渲染空态）。
+#[tauri::command]
+pub async fn list_vscode_sessions() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| match vscode_ext::active_ext_uid() {
+        Some(uid) => vscode_session::list_vscode_sessions(&uid),
+        None => json!({ "sourceUid": Value::Null, "sessions": [], "skipped": 0 }),
+    })
+    .await
+    .map_err(|error| format!("列出 VS Code CodeBuddy 插件会话失败: {error}"))
+}
+
+/// POST /api/vscode-ext/switch —— 注入凭证到 VS Code CodeBuddy 扩展。
+///
+/// `copySessions` 非空时，切换前先把勾选的会话复制到目标账号（新 id，加法）并登记关联；
+/// `syncSelections` 非空时，再把关联会话的新增内容同步过去（只同步不复制同样可用）。
+/// `restart` 缺省 true：VS Code 正在运行时由后端「优雅退出 → 写入 → 重新打开」，
+/// 传 false 则退回「请先完全退出 VS Code」的手动模式。
+///
+/// async + spawn_blocking：读写 state.vscdb + DPAPI 解密 + 等待编辑器退出 + 会话目录
+/// 复制都可能阻塞，避免卡 UI。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn switch_vscode_ext_account(
+    account_id: String,
+    restart: Option<bool>,
+    copy_sessions: Option<Vec<vscode_session::CopyItem>>,
+    sync_selections: Option<Value>,
+) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    let restart = restart.unwrap_or(true);
+    let items = copy_sessions.unwrap_or_default();
+    // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传。
+    let sync_selections = session::parse_sync_selections(sync_selections.as_ref())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // 复制与同步都没勾选时才退回纯切换路径（不再由 `copySessions` 单独决定）。
+        if items.is_empty() && sync_selections.is_empty() {
+            vscode_ext::switch_account(&account_id, restart)
+        } else {
+            vscode_session::switch_vscode_ext_with_copy(
+                &account_id,
+                restart,
+                &items,
+                &sync_selections,
+            )
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// POST /api/vscode-ext/session-links —— 预览「当前插件账号 → 目标账号」可同步的关联会话。
+///
+/// 只读：返回 `supported / storeStatus / groups`，其中每组的 `defaultChecked` 与
+/// `availableModes` 是前端勾选权限的唯一来源，前端不得自行扩大。
+/// async + spawn_blocking：会扫描扩展数据目录并读取会话正文，避免阻塞 UI。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn vscode_session_links_preview(target_account_id: String) -> Result<Value, String> {
+    if target_account_id.trim().is_empty() {
+        return Err("缺少 targetAccountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        vscode_session_sync::links_preview(&target)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn get_codebuddy_ide_status() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(codebuddy_ide::status)
+        .await
+        .map_err(|error| format!("查询 CodeBuddy IDE 状态失败: {error}"))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn switch_codebuddy_ide_account(
+    account_id: String,
+    restart: Option<bool>,
+) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        codebuddy_ide::switch_account(&account_id, restart.unwrap_or(true))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// POST /api/vscode-ext/detect —— 读取本机 VS Code 扩展当前登录并尝试匹配账号库。
+///
+/// async + spawn_blocking：会通过 Safe Storage 读取子进程，避免阻塞主线程。
+#[tauri::command]
+pub async fn detect_vscode_ext_account() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(vscode_ext::detect_current_account)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn detect_codebuddy_ide_account() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(codebuddy_ide::detect_current_account)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 
 /// DELETE /api/delete —— 删除账号。
 #[tauri::command]
@@ -150,22 +292,23 @@ pub fn delete_account(account_id: String) -> Result<Value, String> {
     Ok(json!({ "ok": true }))
 }
 
-/// POST /api/oauth/start —— 发起 OAuth 扫码登录。
+/// POST /api/oauth/start —— 发起 OAuth 扫码登录（`variant` 缺省国内版）。
 #[tauri::command]
-pub async fn oauth_start() -> Result<Value, String> {
-    oauth::oauth_start().await
+pub async fn oauth_start(variant: Option<String>) -> Result<Value, String> {
+    oauth::oauth_start(WbVariant::parse(variant.as_deref())).await
 }
 
-/// GET /api/oauth/status —— 轮询采集结果。
+/// GET /api/oauth/status —— 轮询采集结果（档位取发起时记录，无需传参）。
 #[tauri::command]
 pub async fn oauth_status(login_id: String) -> Value {
     oauth::oauth_poll(&login_id).await
 }
 
-/// POST /api/import-local —— 导入本机当前账号。
+/// POST /api/import-local —— 导入本机当前账号（`variant` 缺省国内版）。
 #[tauri::command]
-pub fn import_local() -> Result<Value, String> {
-    account::import_local().map(|acc| json!({ "ok": true, "account": acc }))
+pub fn import_local(variant: Option<String>) -> Result<Value, String> {
+    account::import_local(WbVariant::parse(variant.as_deref()))
+        .map(|acc| json!({ "ok": true, "account": acc }))
 }
 
 // ---------------------------------------------------------------------------
@@ -224,17 +367,22 @@ pub fn open_permission_settings(target: Option<String>) -> Result<(), String> {
 }
 
 /// 权限自检：尝试在认证文件目录写/删探针文件，确认完全磁盘访问等授权是否生效。
+///
+/// 探针放在该档位的登录态文件旁边（两档位同目录，`variant` 缺省国内版）。
 #[tauri::command]
-pub fn check_auth_permission() -> Value {
-    let path = auth_file::auth_file_path();
-    let probe = path.with_file_name("workbuddy-desktop.info.probe");
+pub fn check_auth_permission(variant: Option<String>) -> Value {
+    let variant = WbVariant::parse(variant.as_deref());
+    let path = auth_file::auth_file_path(variant);
+    // 由档位路径派生探针名，避免再写一份档位相关的文件名。
+    let probe = path.with_extension("info.probe");
     match std::fs::write(&probe, "probe") {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
-            json!({ "ok": true, "message": "认证目录可写，权限正常" })
+            json!({ "ok": true, "variant": variant.as_str(), "message": "认证目录可写，权限正常" })
         }
         Err(e) => json!({
             "ok": false,
+            "variant": variant.as_str(),
             "error": e.to_string(),
             "dir": path.parent().map(|p| p.to_string_lossy().to_string()),
             "hint": "请在 系统设置→隐私与安全性 中授权：优先「App 管理」开启 wb-switch，若没有则去「完全磁盘访问」把 wb-switch 拖进去；授权后需重启 App 生效",
@@ -253,7 +401,9 @@ pub fn reveal_app_in_finder() -> Result<(), String> {
     Ok(())
 }
 
-/// POST /api/switch —— 切换账号（备份 → 关进程 → 复制会话 → 写认证 → 重启）。
+/// POST /api/switch —— 切换账号（备份 → 关进程 → 恢复/复制/同步会话 → 写认证 → 重启）。
+///
+/// `syncSelections` 与 HTTP 端同形（`[{groupId, previewToken, mode}]`）。
 ///
 /// async + spawn_blocking：切换中关闭/启动 WorkBuddy 会阻塞数十秒，
 /// 若在同步 command（主线程）执行会卡死整个 UI（loading 遮罩无法渲染）。
@@ -264,6 +414,7 @@ pub async fn switch_account(
     restart: Option<bool>,
     share_sessions: Option<bool>,
     copy_session_ids: Option<Vec<String>>,
+    sync_selections: Option<Value>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
@@ -271,6 +422,9 @@ pub async fn switch_account(
     let restart = restart.unwrap_or(true);
     let share_sessions = share_sessions.unwrap_or(false);
     let copy_ids = copy_session_ids.unwrap_or_default();
+    // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传，
+    // 不在命令层做业务判定。
+    let sync_selections = session::parse_sync_selections(sync_selections.as_ref())?;
     let progress: switch::ProgressFn = Box::new(move |message| {
         let _ = app.emit("switch-progress", json!({ "message": message }));
     });
@@ -281,18 +435,20 @@ pub async fn switch_account(
             restart,
             share_sessions,
             &copy_ids,
+            &sync_selections,
         )
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-/// GET /api/sessions —— 当前账号的会话列表。
+/// GET /api/sessions —— 当前账号的会话列表（`variant` 缺省国内版）。
 #[tauri::command]
-pub fn list_sessions() -> Value {
-    match session::current_user_uid() {
+pub fn list_sessions(variant: Option<String>) -> Value {
+    let variant = WbVariant::parse(variant.as_deref());
+    match session::current_user_uid(variant) {
         Some(uid) => json!({
-            "sessions": session::list_sessions_for_user(&uid),
+            "sessions": session::list_sessions_for_user(variant, &uid),
             "current": uid,
         }),
         None => json!({"sessions": [], "current": Value::Null}),
@@ -313,7 +469,34 @@ pub async fn copy_sessions(
     }
     tauri::async_runtime::spawn_blocking(move || {
         let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
-        Ok(session::copy_sessions_for_switch(&target, &session_ids).unwrap_or_else(|| json!({})))
+        // 档位取目标账号自身（copy_sessions_for_switch 内部判定）。
+        session::copy_sessions_for_switch(&target, &session_ids)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 预览「当前账号 → 目标账号」的关联会话同步项（桌面端 command）。
+///
+/// 只读：返回 `supported / storeStatus / groups`，其中每组的 `defaultChecked` 与
+/// `availableModes` 是前端勾选权限的唯一来源，前端不得自行扩大。
+/// `variant` 缺省取目标账号自身档位：来源 uid 从该档位的登录态读取，目标与来源必须在
+/// 同一档位内比较（与 `copy_sessions` 的档位约定一致）。与 `POST /api/session-links/preview` 同形。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_links_preview(
+    target_account_id: String,
+    variant: Option<String>,
+) -> Result<Value, String> {
+    if target_account_id.trim().is_empty() {
+        return Err("缺少 targetAccountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        let variant = variant
+            .as_deref()
+            .map(|raw| WbVariant::parse(Some(raw)))
+            .unwrap_or_else(|| account::variant_of(&target));
+        session::session_links_preview(variant, &target)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -323,11 +506,14 @@ pub async fn copy_sessions(
 // 阶段 3：签到 + token 刷新
 // ---------------------------------------------------------------------------
 
-/// GET /api/checkin/status —— 查询单账号签到状态。
+/// GET /api/checkin/status —— 查询单账号签到状态（档位取账号自身）。
 #[tauri::command]
 pub async fn get_checkin_status(account_id: String) -> Result<Value, String> {
     let acc = account::find_account(&account_id).ok_or("账号不存在")?;
-    Ok(checkin::get_checkin_status(&acc).await)
+    let mut status = checkin::get_checkin_status_for_display(&acc).await;
+    // 结果行带档位，前端按当前档位过滤时无需再查账号。
+    status["variant"] = json!(account::variant_of(&acc).as_str());
+    Ok(status)
 }
 
 /// POST /api/credits —— 查询单账号积分资源及到期时间。
@@ -351,6 +537,78 @@ pub async fn get_token_statistics(days: Option<i64>) -> Result<Value, String> {
         .map_err(|error| format!("扫描 Token 统计失败: {error}"))
 }
 
+/// GET /api/rate-limits —— 模型限额台账（全部账号当前受限的模型与官方恢复时刻）。
+///
+/// 不接收档位参数：扫描本身就是全局的（两档位各扫一遍）。扫描读取本机日志文件，
+/// 放 blocking 线程避免阻塞主线程；无受限模型时返回空数组，不是错误。
+#[tauri::command]
+pub async fn get_rate_limits() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(limits::get_rate_limits)
+        .await
+        .map_err(|error| format!("扫描模型限额失败: {error}"))
+}
+
+/// GET /api/rate-limits/hook-status —— hook 安装状态（脚本 + 三处客户端配置逐项结果）。
+///
+/// 读三个 `settings.json` 与一个脚本文件，放 blocking 线程避免占用主线程。
+#[tauri::command]
+pub async fn get_rate_limit_hook_status() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(with_hook_runtime_fields)
+        .await
+        .map_err(|error| format!("查询限额 hook 状态失败: {error}"))
+}
+
+/// POST /api/rate-limits/install-hook —— 安装 hook（幂等，写前备份；同时清除「卸载过」标记）。
+#[tauri::command]
+pub async fn install_rate_limit_hook() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let result = rate_limit_hook::install_hook();
+        // 扫描范围随安装结果变化（只对未注册的来源扫日志），缓存必须作废。
+        limits::invalidate_scan_cache();
+        result.map(|_| with_hook_runtime_fields())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// POST /api/rate-limits/uninstall-hook —— 卸载 hook（移除注册条目，尽量逐字节还原）。
+///
+/// 卸载即用户拒绝自动接入：`install_hook` / `hookOptOut` 的置位在 core 里与安装逻辑同处，
+/// 两个宿主（桌面端 / webui）共用同一语义。
+#[tauri::command]
+pub async fn uninstall_rate_limit_hook() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let result = rate_limit_hook::uninstall_hook();
+        limits::invalidate_scan_cache();
+        result.map(|_| with_hook_runtime_fields())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// hook 状态 + 运行期字段（最近一次 hook 事件时刻）。
+fn with_hook_runtime_fields() -> Value {
+    let mut status = rate_limit_hook::hook_status();
+    status["lastEventAt"] = json!(rate_limit_events::last_event_at());
+    status
+}
+
+/// GET /api/rate-limits/config —— 限额监听开关。
+#[tauri::command]
+pub fn get_rate_limit_config() -> Value {
+    crate::modules::config::load_rate_limit_config()
+}
+
+/// POST /api/rate-limits/config —— 保存限额监听开关。
+///
+/// 走 `limits::save_rate_limit_config`：`scanIdeLogs` 变化时作废扫描缓存（下一次按当前
+/// 来源范围重算），否则关掉 IDE 扫描后下一次还会按旧缓存把两个 IDE 扫一遍。
+#[tauri::command]
+pub fn save_rate_limit_config(config: Value) -> Result<Value, String> {
+    limits::save_rate_limit_config(&config).map_err(|e| e.to_string())?;
+    Ok(crate::modules::config::load_rate_limit_config())
+}
+
 /// POST /api/checkin —— 单账号立即签到。
 #[tauri::command]
 pub async fn checkin(account_id: String) -> Result<Value, String> {
@@ -358,10 +616,13 @@ pub async fn checkin(account_id: String) -> Result<Value, String> {
     Ok(checkin::checkin_account(&acc).await)
 }
 
-/// POST /api/checkin/all —— 全部账号立即签到。
+/// POST /api/checkin/all —— 全部账号立即签到（每个账号按自身档位）。
+/// `variant` 缺省为 `None`（全部档位，保持原行为）；显式传入时只处理该档位。
+/// 关闭自动签到的账号逐账号返回 skipped 原因（设置页与托盘同样遵守）。
 #[tauri::command]
-pub async fn checkin_all() -> Value {
-    checkin::run_checkin_all().await
+pub async fn checkin_all(variant: Option<String>) -> Value {
+    let variant = variant.as_deref().map(|raw| WbVariant::parse(Some(raw)));
+    checkin::run_checkin_all(variant).await
 }
 
 /// GET /api/checkin/config —— 自动签到配置。
@@ -377,10 +638,10 @@ pub fn save_auto_checkin_config(config: Value) -> Result<Value, String> {
     Ok(crate::modules::config::load_checkin_config())
 }
 
-/// GET /api/checkin/logs —— 签到日志。
+/// GET /api/checkin/logs —— 签到日志（每行带 `variant`，便于前端按档位过滤）。
 #[tauri::command]
 pub fn get_checkin_logs() -> Value {
-    json!({ "logs": crate::modules::config::load_checkin_logs() })
+    json!({ "logs": checkin::load_checkin_logs_with_variant() })
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +649,10 @@ pub fn get_checkin_logs() -> Value {
 // ---------------------------------------------------------------------------
 
 /// GET /api/travel/status —— 查询单账号今日旅行状态标签。
+///
+/// 档位取账号自身；不支持成长中心的档位（国际版）由 core 返回
+/// `{"status":"skipped","reason":"unsupported_variant"}` 形态，宿主原样透传，
+/// 不把它吞成「未旅行」。
 #[tauri::command]
 pub async fn get_travel_status(account_id: String) -> Result<Value, String> {
     account::find_account(&account_id).ok_or("账号不存在")?;
@@ -538,9 +803,14 @@ pub fn rotate_status() -> Value {
 }
 
 /// POST /api/rotate/run —— 手动触发一次轮换检查。
+///
+/// 返回体里的 `notify`（若因存活门控被推迟且未超当日预算）由宿主投递系统通知；
+/// 无头 server 只返回该字段，不投递。
 #[tauri::command]
-pub async fn run_rotate() -> Value {
-    rotate::run_rotate_cycle().await
+pub async fn run_rotate(app: tauri::AppHandle) -> Value {
+    let result = rotate::run_rotate_cycle().await;
+    crate::deliver_rotate_notify(&app, &result);
+    result
 }
 
 /// GET /api/rotate/logs —— 最近轮换日志。
@@ -742,4 +1012,30 @@ pub fn set_launch_at_login_enabled(_app: tauri::AppHandle, enabled: bool) -> Res
         let _ = enabled;
         Err("当前平台不支持开机自启".to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// 通知存档（toast 事后可查）
+// ---------------------------------------------------------------------------
+
+/// 记录一条应用内提示；前端所有 toast 都会同步写一份，失败不影响提示本身。
+#[tauri::command]
+pub async fn record_notification(
+    level: String,
+    title: String,
+    description: Option<String>,
+) -> Result<(), String> {
+    notifications::record(&level, &title, description.as_deref())
+}
+
+/// 读取最近的通知（新的在前，最多 100 条）。
+#[tauri::command]
+pub async fn list_notifications() -> Result<Value, String> {
+    Ok(json!({ "items": notifications::list()? }))
+}
+
+/// 清空通知存档。
+#[tauri::command]
+pub async fn clear_notifications() -> Result<(), String> {
+    notifications::clear()
 }

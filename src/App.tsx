@@ -17,6 +17,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
+import { useRotateDeferredNotice } from "@/lib/use-rotate-deferred-notice";
 import { useWorkbuddyStatusRefresh } from "@/lib/use-workbuddy-status-refresh";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -89,6 +90,7 @@ function Layout() {
     api.isDesktop() && typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
   useCreditAutoRefresh();
   useWorkbuddyStatusRefresh();
+  useRotateDeferredNotice();
 
   return (
     <div className="flex h-screen min-h-0 overflow-hidden bg-background">

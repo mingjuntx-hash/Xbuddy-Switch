@@ -5,67 +5,60 @@
 //! write_account_to_auth_file）在阶段 2 随 switch.rs 落地。
 
 use serde_json::{json, Map, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::modules::account::get_str;
+use crate::modules::account::{get_str, secret_value};
 use crate::modules::config::{atomic_write, backup_dir, now_ms, utc_iso};
+use crate::modules::variant::WbVariant;
 
-/// WorkBuddy 官方认证文件路径（与 cockpit 一致）。
-pub fn auth_file_path() -> PathBuf {
-    let home = crate::modules::config::home_dir();
-    #[cfg(target_os = "macos")]
-    return home.join(
-        "Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info",
-    );
-    #[cfg(target_os = "windows")]
-    return home.join("AppData/Local/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info");
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    return home.join(".local/share/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info");
+/// WorkBuddy 官方认证文件路径（按档位，与 cockpit 一致）。
+pub fn auth_file_path(variant: WbVariant) -> PathBuf {
+    variant.auth_file_path()
 }
 
-/// WorkBuddy 应用路径。
-pub fn workbuddy_app_path() -> PathBuf {
+/// WorkBuddy 应用路径（按档位）。
+pub fn workbuddy_app_path(variant: WbVariant) -> PathBuf {
     #[cfg(target_os = "macos")]
-    return crate::modules::process::macos_workbuddy_app_path();
+    return crate::modules::process::macos_workbuddy_app_path(variant);
 
     #[cfg(target_os = "windows")]
     {
         // 探测顺序：运行进程 Path → 缓存 → 注册表 → 环境变量/盘符扫描。
         // 都找不到时返回 LOCALAPPDATA 默认路径，供启动失败文案写出尝试路径。
-        if let Some(exe) = crate::modules::process::windows_workbuddy_exe_path() {
+        if let Some(exe) = crate::modules::process::windows_workbuddy_exe_path(variant) {
             return exe;
         }
-        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-        return std::path::Path::new(&local)
-            .join("Programs")
-            .join("WorkBuddy")
-            .join("WorkBuddy.exe");
+        return crate::modules::process::windows_default_app_path(variant);
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    return PathBuf::from("/usr/bin/workbuddy");
+    return variant.linux_app_path();
 }
 
 /// 读取认证文件 JSON；不存在或解析失败返回 None。
-pub fn read_auth_file() -> Option<Value> {
-    let path = auth_file_path();
+pub fn read_auth_file(variant: WbVariant) -> Option<Value> {
+    read_auth_file_at(&auth_file_path(variant))
+}
+
+/// 读取指定路径的认证文件（单测注入临时登录态文件用）。
+pub fn read_auth_file_at(path: &Path) -> Option<Value> {
     if !path.exists() {
         return None;
     }
-    let text = std::fs::read_to_string(&path).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
 
 /// 切换前备份当前认证文件，返回备份路径。对照 server.py `backup_auth_file`。
-pub fn backup_auth_file() -> Option<PathBuf> {
-    let path = auth_file_path();
+pub fn backup_auth_file(variant: WbVariant) -> Option<PathBuf> {
+    let path = auth_file_path(variant);
     if !path.exists() {
         return None;
     }
     let dir = backup_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let ts = utc_iso();
-    let dest = dir.join(format!("workbuddy-desktop.{ts}.info"));
+    let dest = dir.join(variant.backup_file_name(&ts));
     std::fs::copy(&path, &dest).ok()?;
     Some(dest)
 }
@@ -130,13 +123,15 @@ pub fn build_auth_obj(acc: &Value) -> Value {
     let expires_at = acc.get("expiresAt").and_then(|v| v.as_i64());
     let now = now_ms();
 
+    // token 可能是明文字符串或 WorkBuddy 5.6 加密信封：信封必须原样写回，
+    // 由 WorkBuddy 读取时自行解密（同一 keyblob）。降级为空串会静默毁掉登录态。
     obj.insert(
         "accessToken".to_string(),
-        get_str(acc, "access_token").unwrap_or_default().into(),
+        secret_value(acc, "access_token").unwrap_or_else(|| json!("")),
     );
     obj.insert(
         "refreshToken".to_string(),
-        get_str(acc, "refresh_token").unwrap_or_default().into(),
+        secret_value(acc, "refresh_token").unwrap_or_else(|| json!("")),
     );
     obj.insert("tokenType".to_string(), token_type.into());
     obj.insert(
@@ -177,13 +172,13 @@ pub fn build_auth_obj(acc: &Value) -> Value {
 }
 
 /// 把账号写入官方认证文件（原子写 + 写后校验）。对照 server.py `write_account_to_auth_file`。
-pub fn write_account_to_auth_file(acc: &Value) -> Result<(), String> {
-    let path = auth_file_path();
+pub fn write_account_to_auth_file(acc: &Value, variant: WbVariant) -> Result<(), String> {
+    let path = auth_file_path(variant);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let existing = read_auth_file().unwrap_or_else(|| json!({}));
+    let existing = read_auth_file(variant).unwrap_or_else(|| json!({}));
     eprintln!(
         "[auth] write_account: existing is_object={} allAccounts_len={}",
         existing.is_object(),
@@ -239,16 +234,16 @@ pub fn write_account_to_auth_file(acc: &Value) -> Result<(), String> {
         return Err(e.to_string());
     }
 
-    // 写后校验
+    // 写后校验：按值比较（token 可能是明文字符串，也可能是 WorkBuddy 5.6 加密信封对象）
     let written: Value =
         serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     let written_token = written
         .get("auth")
         .and_then(|a| a.get("accessToken"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let expect_token = get_str(acc, "access_token").unwrap_or_default();
+        .cloned()
+        .unwrap_or(Value::Null);
+    let expect_token = auth_obj.get("accessToken").cloned().unwrap_or(Value::Null);
     if written_token != expect_token {
         return Err("认证文件写后校验失败，未写入目标账号".to_string());
     }
@@ -262,11 +257,11 @@ fn setdefault(map: &mut Map<String, Value>, key: &str, value: Value) {
 }
 
 /// 从当前 WorkBuddy 登录态导入账号。对照 server.py `import_from_auth_file`。
-pub fn import_from_auth_file() -> Option<Value> {
-    imported_account_from_root(read_auth_file()?)
+pub fn import_from_auth_file(variant: WbVariant) -> Option<Value> {
+    imported_account_from_root(read_auth_file(variant)?, variant)
 }
 
-fn imported_account_from_root(root: Value) -> Option<Value> {
+fn imported_account_from_root(root: Value, variant: WbVariant) -> Option<Value> {
     let account_obj = root
         .get("account")
         .filter(|v| v.is_object())
@@ -280,21 +275,24 @@ fn imported_account_from_root(root: Value) -> Option<Value> {
 
     let uid = get_str(&root, "uid").or_else(|| get_str(&account_obj, "uid"));
     let uid = uid.or_else(|| get_str(&account_obj, "id"));
-    let nickname = get_str(&root, "nickname")
-        .or_else(|| get_str(&root, "name"))
-        .or_else(|| get_str(&account_obj, "nickname"))
-        .or_else(|| get_str(&account_obj, "label"));
+    // WorkBuddy 5.6 起 nickname/accessToken/refreshToken 可能是 `{$wbEncrypted, envelope}`
+    // 加密信封：这里必须原样保留（secret_value），不能 get_str 强转字符串——
+    // 否则 accessToken 取不到导致导入恒 400，切换写回时也会把信封覆盖成空串。
+    let nickname = secret_value(&root, "nickname")
+        .or_else(|| secret_value(&root, "name"))
+        .or_else(|| secret_value(&account_obj, "nickname"))
+        .or_else(|| secret_value(&account_obj, "label"));
     let email = get_str(&root, "email")
         .or_else(|| get_str(&account_obj, "email"))
         .or_else(|| get_str(&auth_obj, "email"));
-    let access_token = get_str(&auth_obj, "accessToken")
-        .or_else(|| get_str(&auth_obj, "access_token"))
-        .or_else(|| get_str(&root, "accessToken"))
-        .or_else(|| get_str(&root, "access_token"));
-    let refresh_token = get_str(&auth_obj, "refreshToken")
-        .or_else(|| get_str(&auth_obj, "refresh_token"))
-        .or_else(|| get_str(&root, "refreshToken"))
-        .or_else(|| get_str(&root, "refresh_token"));
+    let access_token = secret_value(&auth_obj, "accessToken")
+        .or_else(|| secret_value(&auth_obj, "access_token"))
+        .or_else(|| secret_value(&root, "accessToken"))
+        .or_else(|| secret_value(&root, "access_token"));
+    let refresh_token = secret_value(&auth_obj, "refreshToken")
+        .or_else(|| secret_value(&auth_obj, "refresh_token"))
+        .or_else(|| secret_value(&root, "refreshToken"))
+        .or_else(|| secret_value(&root, "refresh_token"));
     let token_type = get_str(&auth_obj, "tokenType")
         .or_else(|| get_str(&auth_obj, "token_type"))
         .unwrap_or_else(|| "Bearer".to_string());
@@ -314,6 +312,7 @@ fn imported_account_from_root(root: Value) -> Option<Value> {
         "uid": uid,
         "nickname": nickname,
         "email": email,
+        "variant": variant.as_str(),
         "enterpriseName": get_str(&root, "enterpriseName")
             .or_else(|| get_str(&root, "enterprise_name"))
             .or_else(|| get_str(&account_obj, "enterpriseName"))
@@ -351,7 +350,7 @@ mod tests {
 
     #[test]
     fn auth_file_path_is_expected_location() {
-        let p = auth_file_path();
+        let p = auth_file_path(WbVariant::Cn);
         let s = p.to_string_lossy();
         assert!(
             s.contains("CodeBuddyExtension"),
@@ -360,6 +359,24 @@ mod tests {
         assert!(
             s.ends_with("workbuddy-desktop.info"),
             "文件名应为 workbuddy-desktop.info: {s}"
+        );
+
+        // 国际版：同目录、不同文件
+        let ai = auth_file_path(WbVariant::Ai);
+        assert_eq!(ai.parent(), p.parent());
+        assert!(ai.to_string_lossy().ends_with("workbuddy-desktop-ai.info"));
+    }
+
+    #[test]
+    fn backup_file_name_is_distinguishable_per_variant() {
+        let ts = "2026-09-15T00-00-00Z";
+        assert_eq!(
+            WbVariant::Cn.backup_file_name(ts),
+            "workbuddy-desktop.2026-09-15T00-00-00Z.info"
+        );
+        assert_eq!(
+            WbVariant::Ai.backup_file_name(ts),
+            "workbuddy-desktop-ai.2026-09-15T00-00-00Z.info"
         );
     }
 
@@ -384,14 +401,67 @@ mod tests {
 
     #[test]
     fn import_without_email_does_not_synthesize_one() {
-        let account = imported_account_from_root(json!({
-            "account": {"uid": "u-1", "nickname": "同名用户"},
-            "auth": {"accessToken": "test-token"}
-        }))
+        let account = imported_account_from_root(
+            json!({
+                "account": {"uid": "u-1", "nickname": "同名用户"},
+                "auth": {"accessToken": "test-token"}
+            }),
+            WbVariant::Cn,
+        )
         .expect("auth payload should import");
 
         assert_eq!(account["uid"], "u-1");
         assert_eq!(account["nickname"], "同名用户");
         assert!(account["email"].is_null());
+        assert_eq!(account["variant"], "cn");
+    }
+
+    /// 回归：`"accessToken": ""`（含纯空白）的登录态必须判为「没有 token」。
+    /// 修复前 `secret_value` 对空串返回 `Some("")`，`imported_account_from_root` 里
+    /// `access_token.is_none()` 的检查拦不住，导入会落库一条空凭据账号；
+    /// `/api/import-local` 也因此不再返回 400「未读取到本地 WorkBuddy 登录信息」。
+    #[test]
+    fn blank_access_token_is_not_imported() {
+        for blank in ["", "   ", "\t\n"] {
+            let imported = imported_account_from_root(
+                json!({
+                    "account": {"uid": "u-1", "nickname": "小明"},
+                    "auth": {"accessToken": blank, "refreshToken": "RT-1"}
+                }),
+                WbVariant::Cn,
+            );
+            assert!(imported.is_none(), "空 accessToken（{blank:?}）不得被导入");
+        }
+
+        // 加密信封不受影响：仍原样保留，切换写回依赖它。
+        let envelope = json!({"$wbEncrypted": 1, "envelope": "enc"});
+        let imported = imported_account_from_root(
+            json!({
+                "account": {"uid": "u-1"},
+                "auth": {"accessToken": envelope.clone()}
+            }),
+            WbVariant::Cn,
+        )
+        .expect("加密信封 accessToken 必须可导入");
+        assert_eq!(imported["access_token"], envelope);
+    }
+
+    #[test]
+    fn imported_account_records_source_variant() {
+        let account = imported_account_from_root(
+            json!({
+                "account": {"uid": "u-ai"},
+                "auth": {"accessToken": "at-ai", "domain": "www.workbuddy.ai"}
+            }),
+            WbVariant::Ai,
+        )
+        .expect("auth payload should import");
+
+        assert_eq!(account["variant"], "ai");
+        assert_eq!(
+            crate::modules::account::variant_of(&account),
+            WbVariant::Ai,
+            "导入账号自带档位，无需依赖域名兜底"
+        );
     }
 }

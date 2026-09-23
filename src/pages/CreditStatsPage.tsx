@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ComponentProps } from "react";
+import { useCallback, useEffect, useMemo, useState, type ComponentProps } from "react";
 import { Bar, BarChart, CartesianGrid, Rectangle, XAxis, YAxis } from "recharts";
 import {
   CalendarDays,
@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/chart";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import * as api from "@/lib/api";
+import { creditResourceName } from "@/lib/credit-package-names";
 import { getStackedSegmentVisualLayout } from "@/lib/stacked-bar-visuals";
 import type {
   CreditExpiry,
@@ -40,15 +41,27 @@ import type {
   CreditOfficialUsageAccount,
   CreditOfficialUsageModel,
   CreditOfficialUsageRequest,
-  CreditResource,
   CreditStatsAccount,
   CreditStatsDailyPoint,
-  // CreditStatsEvent, // 最近事件卡片隐藏后未使用
+  CreditStatsEvent,
   CreditStatistics,
+  WbVariant,
 } from "@/lib/types";
+import { accountVariant, DEFAULT_VARIANT, normalizeVariant, variantLabel } from "@/lib/variant";
 import { useAccountsStore } from "@/stores/accounts";
 
 type RangeKey = "30d" | "today" | "7d" | "month";
+type StatsVariantView = "all" | "cn" | "ai";
+
+function statsVariantViewLabel(view: StatsVariantView): string {
+  return view === "all" ? "全部" : variantLabel(view);
+}
+
+const VARIANT_VIEW_OPTIONS: { key: StatsVariantView; label: string }[] = [
+  { key: "all", label: statsVariantViewLabel("all") },
+  { key: "cn", label: statsVariantViewLabel("cn") },
+  { key: "ai", label: statsVariantViewLabel("ai") },
+];
 
 const RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
   { key: "30d", label: "近 30 天" },
@@ -56,6 +69,30 @@ const RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
   { key: "7d", label: "近 7 天" },
   { key: "month", label: "本月" },
 ];
+
+const USAGE_SHARE_RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
+  { key: "today", label: "今天" },
+  { key: "7d", label: "近 7 天" },
+  { key: "30d", label: "近 30 天" },
+  { key: "month", label: "本月" },
+];
+
+/** 账号消耗构成的分组顺序，与顶部档位切换一致；固定顺序避免组序随消耗高低跳动。 */
+const VARIANT_GROUP_ORDER: WbVariant[] = ["cn", "ai"];
+
+/**
+ * 读取指定范围的消耗值；官方账号不可用（字段为 null）时返回 null，调用方不计入占比分母。
+ * 「近 30 天」没有对应的汇总字段，由 rangeUsage 从逐日数据求和。
+ */
+function usageShareValue(
+  account: { usageToday?: number | null; usage7Days?: number | null; usageThisMonth?: number | null },
+  daily: CreditStatsDailyPoint[] | undefined,
+  range: RangeKey,
+): number | null {
+  const { usageToday, usage7Days, usageThisMonth } = account;
+  if (usageToday == null || usage7Days == null || usageThisMonth == null) return null;
+  return rangeUsage({ usageToday, usage7Days, usageThisMonth }, daily ?? [], range);
+}
 
 function dateKey(date: Date): string {
   const pad = (value: number) => String(value).padStart(2, "0");
@@ -93,12 +130,190 @@ function formatDate(ts: number | null | undefined): string {
   });
 }
 
+function formatExpiryDateTime(ts: number | null | undefined): string {
+  if (ts === null || ts === undefined) return "—";
+  return new Date(ts).toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function formatChartDate(date: string): string {
   return date.slice(5).replace("-", "/");
 }
 
 function accountLabel(account: { accountName?: string | null; accountId: string }): string {
   return account.accountName || account.accountId;
+}
+
+/** 读取可选的后端档位标记；缺省（当前后端不下发）时返回 undefined，由调用方回退到映射表。 */
+function taggedVariant(value: { variant?: unknown }): WbVariant | undefined {
+  return value.variant === undefined ? undefined : normalizeVariant(value.variant);
+}
+
+function resolveAccountVariant(
+  account: CreditStatsAccount,
+  variantByAccountId: Map<string, WbVariant>,
+): WbVariant {
+  return taggedVariant(account) ?? variantByAccountId.get(account.accountId) ?? DEFAULT_VARIANT;
+}
+
+function resolveEventVariant(
+  event: CreditStatsEvent,
+  variantByAccountId: Map<string, WbVariant>,
+): WbVariant {
+  const tagged = taggedVariant(event);
+  if (tagged) return tagged;
+  if (event.accountId) return variantByAccountId.get(event.accountId) ?? DEFAULT_VARIANT;
+  return DEFAULT_VARIANT;
+}
+
+function mergeOfficialModels(models: CreditOfficialUsageModel[]): CreditOfficialUsageModel[] {
+  const usage = new Map<string, { requestCount: number; credit: number }>();
+  for (const item of models) {
+    const raw = item.model?.trim() ?? "";
+    const name = !raw || raw === "—" ? "未知模型" : raw;
+    const entry = usage.get(name) ?? { requestCount: 0, credit: 0 };
+    entry.requestCount += item.requestCount;
+    entry.credit += item.credit;
+    usage.set(name, entry);
+  }
+  return [...usage.entries()]
+    .map(([model, value]) => ({ model, requestCount: value.requestCount, credit: value.credit }))
+    .sort(
+      (left, right) =>
+        right.credit - left.credit ||
+        right.requestCount - left.requestCount ||
+        left.model.localeCompare(right.model),
+    );
+}
+
+function officialStatusFromAccounts(
+  accounts: CreditOfficialUsageAccount[],
+): CreditOfficialUsage["status"] {
+  if (accounts.length === 0) return "unavailable";
+  const okCount = accounts.filter((account) => account.ok).length;
+  if (okCount === accounts.length) return "complete";
+  if (okCount > 0) return "partial";
+  return "unavailable";
+}
+
+/** 仅 `cn` / `ai` 视图调用；`all` 必须直接使用后端聚合值（D1）。 */
+function recomputeLocalStats(
+  stats: CreditStatistics,
+  accountIds: Set<string>,
+  viewVariant: WbVariant,
+  variantByAccountId: Map<string, WbVariant>,
+): CreditStatistics {
+  const accounts = stats.accounts.filter((account) => accountIds.has(account.accountId));
+  const events = stats.events.filter(
+    (event) => resolveEventVariant(event, variantByAccountId) === viewVariant,
+  );
+
+  let currentRemaining = 0;
+  let currentCapacity = 0;
+  let usageToday = 0;
+  let usage7Days = 0;
+  let usageThisMonth = 0;
+  const usageByDate = new Map<string, number>();
+  for (const account of accounts) {
+    usageToday += account.usageToday;
+    usage7Days += account.usage7Days;
+    usageThisMonth += account.usageThisMonth;
+    // 与后端口径一致：currentRemaining / currentCapacity 只统计 isCurrent 账号
+    if (account.isCurrent) {
+      currentRemaining += account.currentRemaining ?? 0;
+      currentCapacity += account.totalCapacity ?? 0;
+    }
+    for (const point of account.daily ?? []) {
+      usageByDate.set(point.date, (usageByDate.get(point.date) ?? 0) + point.usage);
+    }
+  }
+
+  const today = dateKey(new Date());
+  let todaySuccess = 0;
+  let todayAlready = 0;
+  let todayFailed = 0;
+  const checkedIn = new Set<string>();
+  for (const event of events) {
+    if (event.kind !== "checkin" || event.date !== today) continue;
+    if (event.result === "success") todaySuccess += 1;
+    else if (event.result === "already") todayAlready += 1;
+    else todayFailed += 1;
+    if ((event.result === "success" || event.result === "already") && event.accountId) {
+      checkedIn.add(event.accountId);
+    }
+  }
+
+  return {
+    ...stats,
+    summary: {
+      currentRemaining,
+      currentCapacity,
+      usageToday,
+      usage7Days,
+      usageThisMonth,
+      todayCheckedInAccounts: checkedIn.size,
+      todaySuccess,
+      todayAlready,
+      todayFailed,
+    },
+    // 日期轴以后端 stats.daily 为基准，避免过滤后曲线变短
+    daily: stats.daily.map((point) => ({
+      date: point.date,
+      usage: usageByDate.get(point.date) ?? 0,
+    })),
+    accounts,
+    events,
+  };
+}
+
+/** 仅 `cn` / `ai` 视图调用；官方账号无 variant，用 accountId 关联 stats 档位集合（D2）。 */
+function recomputeOfficialUsage(
+  official: CreditOfficialUsage,
+  accountIds: Set<string>,
+): CreditOfficialUsage {
+  const accounts = official.accounts.filter((account) => accountIds.has(account.accountId));
+  const usageByDate = new Map<string, number>();
+  const modelsByDate = new Map<string, CreditOfficialUsageModel[]>();
+  const mergedModels: CreditOfficialUsageModel[] = [];
+  let usageToday = 0;
+  let usage7Days = 0;
+  let usageThisMonth = 0;
+  for (const account of accounts) {
+    usageToday += account.usageToday ?? 0;
+    usage7Days += account.usage7Days ?? 0;
+    usageThisMonth += account.usageThisMonth ?? 0;
+    if (account.models) mergedModels.push(...account.models);
+    for (const point of account.daily ?? []) {
+      usageByDate.set(point.date, (usageByDate.get(point.date) ?? 0) + point.usage);
+      if (point.models && point.models.length > 0) {
+        const list = modelsByDate.get(point.date) ?? [];
+        list.push(...point.models);
+        modelsByDate.set(point.date, list);
+      }
+    }
+  }
+  const visibleIds = new Set(accounts.map((account) => account.accountId));
+
+  return {
+    ...official,
+    status: officialStatusFromAccounts(accounts),
+    summary: { usageToday, usage7Days, usageThisMonth },
+    // 日期轴以官方 daily 既有序列为基准，保留范围内空日期
+    daily: official.daily.map((point) => ({
+      date: point.date,
+      usage: usageByDate.get(point.date) ?? 0,
+      models: mergeOfficialModels(modelsByDate.get(point.date) ?? []),
+    })),
+    models: mergeOfficialModels(mergedModels),
+    accounts,
+    requests: official.requests.filter((request) => visibleIds.has(request.accountId)),
+    errors: official.errors.filter((error) => visibleIds.has(error.accountId)),
+  };
 }
 
 function AccountFilterMenu({
@@ -236,10 +451,6 @@ function checkinBadgeVariant(
 }
 */
 
-function resourceName(resource: CreditResource): string {
-  return resource.packageName || resource.packageCode || "未命名资源包";
-}
-
 function StatMetric({
   icon: Icon,
   label,
@@ -278,9 +489,11 @@ const MODEL_COLORS = [
   "var(--data-series-indigo)",
   "var(--data-series-sky)",
   "var(--data-series-lime)",
+  "var(--data-series-orange)",
+  "var(--data-series-pink)",
+  "var(--data-series-cyan)",
+  "var(--data-series-slate)",
 ];
-const MAX_MODELS = 5;
-const OTHER_MODEL = "其他";
 
 interface ModelChartPoint {
   date: string;
@@ -336,7 +549,7 @@ function CreditBarShape({
   );
 }
 
-/** 从官方 daily（全量按模型聚合）构建层叠数据；模型按总消耗取前 N，其余并入「其他」。 */
+/** 从官方 daily（全量按模型聚合）构建层叠数据；模型按总消耗降序全部保留。 */
 function buildStackedChart(
   daily: CreditStatsDailyPoint[],
 ): { models: string[]; points: ModelChartPoint[] } {
@@ -346,23 +559,18 @@ function buildStackedChart(
       modelTotals.set(model.model, (modelTotals.get(model.model) ?? 0) + model.credit);
     }
   }
-  const topModels = [...modelTotals.entries()]
+  const models = [...modelTotals.entries()]
     .sort((left, right) => right[1] - left[1])
-    .slice(0, MAX_MODELS)
     .map(([model]) => model);
 
   const points: ModelChartPoint[] = daily.map((point) => {
     const entry: ModelChartPoint = { date: point.date, total: point.usage };
     for (const model of point.models ?? []) {
-      const key = topModels.includes(model.model) ? model.model : OTHER_MODEL;
+      const key = model.model;
       entry[key] = (typeof entry[key] === "number" ? entry[key] : 0) + model.credit;
     }
     return entry;
   });
-  const models = [...topModels];
-  if (points.some((point) => point[OTHER_MODEL] !== undefined)) {
-    models.push(OTHER_MODEL);
-  }
   return { models, points };
 }
 
@@ -607,7 +815,7 @@ function AccountTable({
                     <td className="max-w-[240px] px-4 py-3 sm:px-5">
                       <button
                         type="button"
-                        className="min-w-0 max-w-full text-left outline-none focus-visible:rounded-md focus-visible:ring-2 focus-visible:ring-ring"
+                        className="min-w-0 max-w-full cursor-pointer text-left outline-none focus-visible:rounded-md focus-visible:ring-2 focus-visible:ring-ring"
                         onClick={() => onSelect(account.accountId)}
                       >
                         <span className="flex min-w-0 items-center gap-2">
@@ -687,10 +895,10 @@ function ResourceBreakdown({ credit, loading }: { credit?: CreditExpiry; loading
         return (
           <div key={`${resource.packageCode || resource.packageName || "resource"}-${index}`} className="min-w-0 px-4 py-1.5 sm:px-5">
             <div className="flex min-w-0 items-center justify-between gap-2">
-              <div className="min-w-0 truncate text-[13px] font-medium">{resourceName(resource)}</div>
+              <div className="min-w-0 truncate text-[13px] font-medium">{creditResourceName(resource, "未命名资源包")}</div>
               <div className="flex shrink-0 items-center gap-2.5">
                 <span className="text-[11px] text-muted-foreground">
-                  {resource.expired ? "已到期" : resource.expiringSoon ? "7 天内到期" : `到期 ${formatDate(resource.expireAt)}`}
+                  {resource.expired ? "已到期" : `到期 ${formatExpiryDateTime(resource.expireAt)}`}
                   {resource.used > 0 ? ` · 已用 ${formatCredits(resource.used)}` : ""}
                 </span>
                 <span className="text-xs font-medium">{formatCredits(resource.remaining)} / {formatCredits(resource.total)}</span>
@@ -712,7 +920,7 @@ function ModelBreakdownRows({ models }: { models: CreditOfficialUsageModel[] }) 
 
   return (
     <div className="space-y-3">
-      {models.slice(0, 8).map((model) => {
+      {models.map((model) => {
         const ratio = totalCredit > 0 ? model.credit / totalCredit : totalRequests > 0 ? model.requestCount / totalRequests : 0;
         const percent = ratio * 100;
         const label = model.model === "—" ? "未知模型" : model.model;
@@ -802,7 +1010,7 @@ function ModelBreakdown({
                   <button
                     key={option.key}
                     type="button"
-                    className={`rounded-md px-2.5 py-1.5 text-xs transition-colors ${
+                    className={`cursor-pointer rounded-md px-2.5 py-1.5 text-xs transition-colors ${
                       range === option.key
                         ? "bg-background font-medium text-foreground shadow-sm"
                         : "text-muted-foreground hover:text-foreground"
@@ -828,9 +1036,170 @@ function ModelBreakdown({
             <span className="font-medium text-foreground">合计 {formatCredits(totalCredit)} 积分</span>
           </div>
           <ModelBreakdownRows models={models} />
-          {models.length > 8 && <p className="mt-3 text-[11px] text-muted-foreground">已展示消耗最高的 8 个模型，其余模型仍计入上方合计。</p>}
         </CardContent>
       )}
+      </Card>
+    </section>
+  );
+}
+
+function AccountUsageShare({
+  stats,
+  officialUsage,
+  variantByAccountId,
+}: {
+  stats: CreditStatistics;
+  officialUsage?: CreditOfficialUsage;
+  variantByAccountId: Map<string, WbVariant>;
+}) {
+  /** 本卡片独立的时间范围，不影响其他卡片 */
+  const [range, setRange] = useState<RangeKey>("today");
+  const official = isOfficialUsageAvailable(officialUsage) ? officialUsage : undefined;
+
+  // 官方用量优先，不可用时回退本地观察口径（与总览、趋势图一致）
+  const rows = useMemo(() => {
+    const source = official
+      ? official.accounts.map((account) => ({
+          accountId: account.accountId,
+          accountName: account.accountName,
+          usage: account.ok ? usageShareValue(account, account.daily, range) : null,
+        }))
+      : stats.accounts.map((account) => ({
+          accountId: account.accountId,
+          accountName: account.accountName,
+          usage: usageShareValue(account, account.daily, range),
+        }));
+    return source
+      .map((row) => ({ ...row, variant: variantByAccountId.get(row.accountId) ?? DEFAULT_VARIANT }))
+      .sort(
+        (a, b) =>
+          (b.usage ?? -1) - (a.usage ?? -1) || accountLabel(a).localeCompare(accountLabel(b)),
+      );
+  }, [official, stats.accounts, range, variantByAccountId]);
+
+  // 国内版与国际版积分体系不同，占比按档位分组、组内各算 100%；单档位视图下自然只有一组
+  const groups = useMemo(() => {
+    const grouped = new Map<WbVariant, typeof rows>();
+    for (const row of rows) {
+      const list = grouped.get(row.variant);
+      if (list) list.push(row);
+      else grouped.set(row.variant, [row]);
+    }
+    return [...grouped.entries()]
+      .sort((a, b) => VARIANT_GROUP_ORDER.indexOf(a[0]) - VARIANT_GROUP_ORDER.indexOf(b[0]))
+      .map(([variant, items]) => ({
+        variant,
+        items,
+        total: items.reduce((sum, item) => sum + (item.usage ?? 0), 0),
+      }));
+  }, [rows]);
+
+  // 官方账号失败时为 null，不能当 0 计入分母，否则占比会失真
+  const measurable = rows.filter((row) => row.usage !== null);
+  const grandTotal = groups.reduce((sum, group) => sum + group.total, 0);
+  const showGroupLabel = groups.length > 1;
+
+  return (
+    <section className="min-w-0 space-y-2.5" aria-labelledby="account-usage-share-title">
+      <div className="px-1">
+        <h2 id="account-usage-share-title" className="text-[13px] font-medium leading-5">
+          账号消耗构成
+        </h2>
+      </div>
+      <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
+        <CardHeader className="gap-0 px-4 pt-3 pb-0 sm:px-5">
+          <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
+            <CardDescription className="min-w-0 text-xs">
+              {official
+                ? `来自 WorkBuddy 官方请求用量 · ${official.rangeStart} 至 ${official.rangeEnd}`
+                : "按本地观察口径；官方用量恢复后刷新即可切换。"}
+            </CardDescription>
+            <div
+              className="flex max-w-full flex-wrap gap-1 rounded-lg bg-muted p-1"
+              aria-label="账号消耗构成范围"
+            >
+              {USAGE_SHARE_RANGE_OPTIONS.map((option) => (
+                <button
+                  key={option.key}
+                  type="button"
+                  className={`cursor-pointer rounded-md px-2.5 py-1.5 text-xs transition-colors ${
+                    range === option.key
+                      ? "bg-background font-medium text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                  onClick={() => setRange(option.key)}
+                  aria-pressed={range === option.key}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </CardHeader>
+        {measurable.length === 0 ? (
+          <CardContent className="px-4 py-8 text-center text-sm text-muted-foreground sm:px-5">
+            {official ? "当前账号的官方用量暂不可用，刷新后重试。" : "暂无账号消耗数据。"}
+          </CardContent>
+        ) : grandTotal <= 0 ? (
+          <CardContent className="px-4 py-8 text-center text-sm text-muted-foreground sm:px-5">
+            当前范围暂未观察到积分消耗。
+          </CardContent>
+        ) : (
+          <CardContent className="px-4 pt-3 pb-4 sm:px-5">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+              <span>共 {rows.length} 个账号</span>
+              <span className="font-medium text-foreground">合计 {formatCredits(grandTotal)} 积分</span>
+            </div>
+            <div className="space-y-4">
+              {groups.map((group, index) => (
+                <div
+                  key={group.variant}
+                  className={`min-w-0 space-y-3 ${index > 0 ? "border-t border-border/60 pt-4" : ""}`}
+                >
+                  {showGroupLabel && (
+                    <div className="flex items-center justify-between gap-2">
+                      <Badge variant="outline">{variantLabel(group.variant)}</Badge>
+                      <span className="text-xs text-muted-foreground">
+                        合计 {formatCredits(group.total)} 积分
+                      </span>
+                    </div>
+                  )}
+                  {group.items.map((row) => {
+                    const ratio = row.usage !== null && group.total > 0 ? row.usage / group.total : 0;
+                    const percent = ratio * 100;
+                    return (
+                      <div key={row.accountId} className="min-w-0">
+                        <div className="flex min-w-0 items-center justify-between gap-3 text-xs">
+                          <span className="min-w-0 truncate font-medium" title={accountLabel(row)}>
+                            {accountLabel(row)}
+                          </span>
+                          <span className="shrink-0 text-muted-foreground">
+                            {row.usage === null ? "官方用量不可用" : `${formatCredits(row.usage)} 积分`}
+                            {row.usage !== null && (
+                              <span className="ml-1.5 font-medium text-foreground">
+                                {group.total > 0
+                                  ? percent < 0.05
+                                    ? "<0.1%"
+                                    : `${percent.toFixed(1)}%`
+                                  : "—"}
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                        <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted" aria-hidden="true">
+                          <div
+                            className="h-full rounded-full bg-primary/75"
+                            style={{ width: `${Math.min(100, Math.max(0, ratio * 100))}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        )}
       </Card>
     </section>
   );
@@ -1173,11 +1542,8 @@ function UnselectedRecentEvents({ events }: { events: CreditStatsEvent[] }) {
 let cachedStatistics: CreditStatistics | null = null;
 let statisticsInflight: Promise<CreditStatistics> | null = null;
 
-/** 进入统计页时距上次刷新超过此时长（ms）则自动触发一次刷新统计 */
+/** 进入统计页时距上次采集超过此时长（ms）则自动重新采集一次 */
 const STATISTICS_AUTO_REFRESH_MS = 30 * 60 * 1000;
-
-/** 最近一次「刷新统计」完成的时刻（会话级，0 = 从未刷新过） */
-let lastStatisticsRefreshAt = 0;
 
 function rememberStatistics(next: CreditStatistics): CreditStatistics {
   cachedStatistics = next;
@@ -1205,6 +1571,7 @@ export default function CreditStatsPage() {
   const [stats, setStats] = useState<CreditStatistics | null>(cachedStatistics);
   const [loading, setLoading] = useState(!cachedStatistics);
   const [error, setError] = useState<string | null>(null);
+  const [viewVariant, setViewVariant] = useState<StatsVariantView>("all");
 
   const load = useCallback(
     async (refresh = false) => {
@@ -1228,7 +1595,6 @@ export default function CreditStatsPage() {
           await refreshCredits(ids);
         }
         setStats(await loadCachedStatistics(refresh));
-        if (refresh) lastStatisticsRefreshAt = Date.now();
       } catch (cause) {
         setError(api.asError(cause));
       } finally {
@@ -1239,16 +1605,54 @@ export default function CreditStatsPage() {
   );
 
   useEffect(() => {
-    // 已有会话缓存且距上次刷新超过 30 分钟时，进入页面自动刷新一次统计
-    const autoRefresh =
-      !api.isDemoMode() &&
-      cachedStatistics !== null &&
-      Date.now() - lastStatisticsRefreshAt >= STATISTICS_AUTO_REFRESH_MS;
-    void load(autoRefresh);
+    void (async () => {
+      // 先渲染本地缓存（后端只读磁盘，不用等网络）
+      await load(false);
+      if (api.isDemoMode()) return;
+      // 过期只看后端记录的采集时刻：会话内变量每次启动都归零，判断不出
+      // 「缓存其实是几小时前采的」，所以刚打开应用时不会自动刷新。
+      const collectedAt = cachedStatistics?.officialUsage?.collectedAt ?? 0;
+      if (collectedAt > 0 && Date.now() - collectedAt < STATISTICS_AUTO_REFRESH_MS) return;
+      if (useAccountsStore.getState().accounts.length === 0) return;
+      await load(true);
+    })();
   }, [load]);
 
-  const officialUsage = stats?.officialUsage;
+  const variantByAccountId = useMemo(() => {
+    const map = new Map<string, WbVariant>();
+    for (const account of accounts) {
+      map.set(account.id, accountVariant(account));
+    }
+    return map;
+  }, [accounts]);
+
+  const variantAccountIds = useMemo(() => {
+    if (!stats || viewVariant === "all") return null;
+    return new Set(
+      stats.accounts
+        .filter((account) => resolveAccountVariant(account, variantByAccountId) === viewVariant)
+        .map((account) => account.accountId),
+    );
+  }, [stats, viewVariant, variantByAccountId]);
+
+  const filteredStats = useMemo(() => {
+    // D1: viewVariant === "all" 时直接沿用后端聚合值（stats.summary / stats.daily），
+    // 不得走过滤重算路径，避免把国内版与国际版不可比积分加回一起，破坏改动前回归基线。
+    if (viewVariant === "all" || !stats || !variantAccountIds) return stats;
+    return recomputeLocalStats(stats, variantAccountIds, viewVariant, variantByAccountId);
+  }, [stats, viewVariant, variantAccountIds, variantByAccountId]);
+
+  const filteredOfficial = useMemo(() => {
+    const officialUsage = stats?.officialUsage;
+    // D1: 「全部」原样使用 officialUsage.summary / daily / models，不走过滤重算。
+    if (viewVariant === "all" || !officialUsage || !variantAccountIds) return officialUsage;
+    return recomputeOfficialUsage(officialUsage, variantAccountIds);
+  }, [stats, viewVariant, variantAccountIds]);
+
+  const officialUsage = filteredOfficial;
   const official = isOfficialUsageAvailable(officialUsage) ? officialUsage : undefined;
+  const variantEmpty =
+    viewVariant !== "all" && variantAccountIds !== null && variantAccountIds.size === 0;
 
   return (
     <div className="mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9">
@@ -1259,18 +1663,42 @@ export default function CreditStatsPage() {
             当前数据更新于 {stats ? formatDateTime(official?.collectedAt ?? stats.generatedAt) : "—"}
           </p>
         </div>
-        <DemoAction>
-          <Button
-            className="shrink-0"
-            variant="outline"
-            size="sm"
-            onClick={() => void load(true)}
-            disabled={loading}
+        <div className="flex min-w-0 max-w-full flex-wrap items-center justify-end gap-2">
+          <div
+            className="flex max-w-full flex-wrap gap-1 rounded-lg bg-muted p-1"
+            role="tablist"
+            aria-label="档位筛选"
           >
-            {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-            刷新统计
-          </Button>
-        </DemoAction>
+            {VARIANT_VIEW_OPTIONS.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                role="tab"
+                aria-selected={viewVariant === option.key}
+                className={`cursor-pointer rounded-md px-2.5 py-1.5 text-xs transition-colors ${
+                  viewVariant === option.key
+                    ? "bg-background font-medium text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+                onClick={() => setViewVariant(option.key)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <DemoAction>
+            <Button
+              className="shrink-0"
+              variant="outline"
+              size="sm"
+              onClick={() => void load(true)}
+              disabled={loading}
+            >
+              {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+              刷新统计
+            </Button>
+          </DemoAction>
+        </div>
       </header>
 
       {error && (
@@ -1291,9 +1719,9 @@ export default function CreditStatsPage() {
           <Loader2 className="animate-spin" />
           正在采集账号积分并加载统计…
         </div>
-      ) : stats ? (
+      ) : stats && filteredStats ? (
         <div className="min-w-0 space-y-12">
-          {accounts.length === 0 && (
+          {viewVariant === "all" && accounts.length === 0 && (
             <Alert>
               <CircleAlert />
               <AlertTitle>暂无当前账号</AlertTitle>
@@ -1301,82 +1729,97 @@ export default function CreditStatsPage() {
             </Alert>
           )}
 
-          {officialUsage && officialUsage.status !== "complete" && (
-            <Alert variant="warning">
-              <CircleAlert />
-              <AlertTitle>
-                {officialUsage.status === "partial" ? "部分账号官方用量未同步" : "官方用量暂不可用"}
-              </AlertTitle>
-              <AlertDescription>
-                {officialUsage.status === "partial"
-                  ? `已同步 ${officialUsage.accounts.filter((account) => account.ok).length}/${officialUsage.accounts.length} 个当前账号；失败账号的官方数值显示为“—”。`
-                  : "今日、近 7 天和本月消耗将使用本地观察口径；官方接口恢复后刷新即可重新同步。"}
-                {officialUsage.errors.length > 0 && (
-                  <span className="text-xs text-amber-900/75">
-                    {officialUsage.errors.map((item) => `${item.accountName}: ${item.error}`).join("；")}
-                  </span>
-                )}
-              </AlertDescription>
-            </Alert>
+          {variantEmpty ? (
+            <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
+              <p>暂无{statsVariantViewLabel(viewVariant)}账号的积分数据。</p>
+              <p className="mt-2 text-xs leading-5">国内版与国际版积分体系不同，不会合并计算。</p>
+            </div>
+          ) : (
+            <>
+              {officialUsage && officialUsage.status !== "complete" && (
+                <Alert variant="warning">
+                  <CircleAlert />
+                  <AlertTitle>
+                    {officialUsage.status === "partial" ? "部分账号官方用量未同步" : "官方用量暂不可用"}
+                  </AlertTitle>
+                  <AlertDescription>
+                    {officialUsage.status === "partial"
+                      ? `已同步 ${officialUsage.accounts.filter((account) => account.ok).length}/${officialUsage.accounts.length} 个当前账号；失败账号的官方数值显示为“—”。`
+                      : "今日、近 7 天和本月消耗将使用本地观察口径；官方接口恢复后刷新即可重新同步。"}
+                    {officialUsage.errors.length > 0 && (
+                      <span className="text-xs text-amber-900/75">
+                        {officialUsage.errors.map((item) => `${item.accountName}: ${item.error}`).join("；")}
+                      </span>
+                    )}
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              <Card className="min-w-0 gap-0 overflow-hidden rounded-2xl bg-card/70 py-0 shadow-none" aria-label="积分总览">
+                <CardContent className="grid min-w-0 grid-cols-1 divide-y divide-border/60 p-0 sm:grid-cols-4 sm:divide-y-0 sm:py-5">
+                  <StatMetric
+                    icon={Sparkles}
+                    label="剩余积分"
+                    value={formatCredits(filteredStats.summary.currentRemaining)}
+                  />
+                  <StatMetric
+                    icon={TrendingDown}
+                    label="今日消耗"
+                    value={formatCredits(official ? official.summary.usageToday : filteredStats.summary.usageToday)}
+                    divided
+                  />
+                  <StatMetric
+                    icon={CalendarDays}
+                    label="近 7 天消耗"
+                    value={formatCredits(official ? official.summary.usage7Days : filteredStats.summary.usage7Days)}
+                    divided
+                  />
+                  <StatMetric
+                    icon={CalendarRange}
+                    label="本月消耗"
+                    value={formatCredits(official ? official.summary.usageThisMonth : filteredStats.summary.usageThisMonth)}
+                    divided
+                  />
+                </CardContent>
+              </Card>
+
+              {!official && !filteredStats.coverageStartAt && filteredStats.events.some((event) => event.kind === "checkin") && (
+                <Alert>
+                  <CircleCheck />
+                  <AlertTitle>目前只有签到记录</AlertTitle>
+                  <AlertDescription>签到不会被计入积分消耗。首次成功采集积分资源后，趋势统计才会开始累计。</AlertDescription>
+                </Alert>
+              )}
+
+              <AccountUsageShare
+                stats={filteredStats}
+                officialUsage={officialUsage}
+                variantByAccountId={variantByAccountId}
+              />
+
+              <TrendChart
+                stats={filteredStats}
+                officialUsage={officialUsage}
+              />
+
+              {official && (
+                <ModelBreakdown
+                  officialUsage={official}
+                />
+              )}
+
+              {/* 与下方「积分明细」重复，先隐藏。
+              <AccountTable stats={stats} officialUsage={officialUsage} selectedId={selectedId} onSelect={setSelectedId} />
+              */}
+
+              <SelectedAccountDetails
+                stats={filteredStats}
+                officialUsage={officialUsage}
+                creditMap={creditMap}
+                creditLoadingMap={creditLoadingMap}
+              />
+            </>
           )}
-
-          <Card className="min-w-0 gap-0 overflow-hidden rounded-2xl bg-card/70 py-0 shadow-none" aria-label="积分总览">
-            <CardContent className="grid min-w-0 grid-cols-1 divide-y divide-border/60 p-0 sm:grid-cols-4 sm:divide-y-0 sm:py-5">
-              <StatMetric
-                icon={Sparkles}
-                label="剩余积分"
-                value={formatCredits(stats.summary.currentRemaining)}
-              />
-              <StatMetric
-                icon={TrendingDown}
-                label="今日消耗"
-                value={formatCredits(official ? official.summary.usageToday : stats.summary.usageToday)}
-                divided
-              />
-              <StatMetric
-                icon={CalendarDays}
-                label="近 7 天消耗"
-                value={formatCredits(official ? official.summary.usage7Days : stats.summary.usage7Days)}
-                divided
-              />
-              <StatMetric
-                icon={CalendarRange}
-                label="本月消耗"
-                value={formatCredits(official ? official.summary.usageThisMonth : stats.summary.usageThisMonth)}
-                divided
-              />
-            </CardContent>
-          </Card>
-
-          {!official && !stats.coverageStartAt && stats.events.some((event) => event.kind === "checkin") && (
-            <Alert>
-              <CircleCheck />
-              <AlertTitle>目前只有签到记录</AlertTitle>
-              <AlertDescription>签到不会被计入积分消耗。首次成功采集积分资源后，趋势统计才会开始累计。</AlertDescription>
-            </Alert>
-          )}
-
-          <TrendChart
-            stats={stats}
-            officialUsage={officialUsage}
-          />
-
-          {official && (
-            <ModelBreakdown
-              officialUsage={official}
-            />
-          )}
-
-          {/* 与下方「积分明细」重复，先隐藏。
-          <AccountTable stats={stats} officialUsage={officialUsage} selectedId={selectedId} onSelect={setSelectedId} />
-          */}
-
-          <SelectedAccountDetails
-            stats={stats}
-            officialUsage={officialUsage}
-            creditMap={creditMap}
-            creditLoadingMap={creditLoadingMap}
-          />
         </div>
       ) : (
         <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">

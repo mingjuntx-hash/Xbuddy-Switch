@@ -1,10 +1,11 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
-  CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
-  GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
-  TravelConfig, TravelStatus,
+  CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CodeBuddyCnIdeStatus, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
+  GithubConfig, RateLimitHookStatus, RateLimitsPayload, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
+  TravelConfig, TravelStatus, VscodeExtStatus, VscodeSessionList,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
+import { accountVariant, normalizeVariant } from "./variant";
 
 export const screenshotDemoEnabled = demoModeEnabled;
 
@@ -21,10 +22,11 @@ interface AccountUsageSeed {
   models: ModelSeed[];
 }
 
+// 演示数据只覆盖国内版；切换国际版时展示的是空状态（不构造国际版演示账号）。
 const accounts: AccountMeta[] = [
-  { id: "demo-account-a", uid: "demo-user-001", email: "test-a@example.com", nickname: "测试 A", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
-  { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
-  { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
+  { id: "demo-account-a", uid: "demo-user-001", email: "test-a@example.com", nickname: "测试 A", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
+  { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
+  { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
 ];
 
 /** 演示模式中的临时 CLI 当前账号，仅存在于本次页面会话。 */
@@ -59,21 +61,23 @@ const usageSeeds: AccountUsageSeed[] = [
   },
 ];
 
+/**
+ * 演示数据刻意让三个账号的积分包数量不同（1 / 2 / 5），覆盖卡片内容区的三种高度：
+ * 1 行、2 行、2 行 + 「查看全部积分包」。这样演示模式能真实暴露「同排卡片因内容长度不同
+ * 而高低参差」的布局问题 —— 若三家都给同样多的包，这个问题在演示里永远看不见。
+ * 请勿"顺手"改回统一数量。
+ */
 const creditPackages = [
+  // 账号 A：1 条 → 1 行，无「查看全部积分包」
   [
-    ["CodeBuddy 个人版国内运营裂变包", 5000, 3186.4, 36],
-    ["CodeBuddy 个人版积分包", 2400, 1180.75, 18],
     ["CodeBuddy 新用户体验包", 800, 386.4, 5],
-    ["CodeBuddy 签到赠送积分", 300, 196.25, 11],
-    ["CodeBuddy 活动奖励积分", 600, 428.6, 27],
   ],
+  // 账号 B：2 条 → 2 行，无「查看全部积分包」（链接在 resources.length > 2 时才出现）
   [
-    ["CodeBuddy 个人版国内运营裂变包", 3600, 2468.2, 24],
     ["CodeBuddy 个人版积分包", 1800, 905.5, 42],
-    ["CodeBuddy 新用户体验包", 500, 128.2, 7],
     ["CodeBuddy 签到赠送积分", 240, 174.35, 15],
-    ["CodeBuddy 活动奖励积分", 400, 286.8, 31],
   ],
+  // 账号 C：5 条 → 2 行 + 「查看全部积分包」
   [
     ["CodeBuddy 个人版国内运营裂变包", 2400, 1680.4, 29],
     ["CodeBuddy 个人版积分包", 1200, 748.6, 55],
@@ -324,7 +328,14 @@ function buildStatistics(): CreditStatistics {
 }
 
 function checkinConfig(): CheckinConfig {
-  return { enabled: true, keepalive_days: 7, lazy_refresh_hours: 12 };
+  return {
+    enabled: true,
+    excluded_account_ids: [],
+    checkin_start: "",
+    checkin_end: "",
+    keepalive_days: 7,
+    lazy_refresh_hours: 12,
+  };
 }
 
 function travelConfig(): TravelConfig {
@@ -339,8 +350,56 @@ function travelStatus(accountId: string): TravelStatus {
   return { label: "no-buddy", rewardCredit: null, locationName: null };
 }
 
+/**
+ * 模型限额演示数据：A 单模型受限（图标无角标）、B 双模型受限（图标带数量角标，
+ * 其中一条故意归因失败以展示「未知模型」）、C 无受限（图标不渲染）。
+ *
+ * 恢复时刻必须相对 `Date.now()` 生成：前端每秒按 `resetAt` 过滤，写死绝对时间会让
+ * 演示页在某个时刻之后再也看不到图标。三条条目也刻意覆盖「小时级 / 分钟级」倒计时。
+ */
+function rateLimits(): RateLimitsPayload {
+  const now = Date.now();
+  return {
+    scannedAt: now,
+    windowDays: 2,
+    accounts: [
+      {
+        accountId: accounts[0].id,
+        limited: [
+          { model: "deepseek-v4.1-flash", resetAt: now + 134 * 60_000, firstSeenAt: now - 26 * 60_000, hitCount: 7 },
+        ],
+      },
+      {
+        accountId: accounts[1].id,
+        limited: [
+          { model: "kimi-k3-1", resetAt: now + 47 * 60_000, firstSeenAt: now - 41 * 60_000, hitCount: 7 },
+          { model: null, resetAt: now + 5 * 3_600_000, firstSeenAt: now - 12 * 60_000, hitCount: 2 },
+        ],
+      },
+    ],
+  };
+}
+
 function rotateConfig(): AutoRotateConfig {
   return { enabled: true, check_interval_minutes: 15, cooldown_minutes: 120, min_gap_hours: 24, min_urgency_hours: 72, active_guard_minutes: 30, min_remaining_credits: 50 };
+}
+
+/** 限额 hook 演示状态：三处配置都显示为已安装。 */
+function rateLimitHookStatus(): RateLimitHookStatus {
+  const base = "/demo/.wb-switch";
+  return {
+    scriptPath: `${base}/hook.sh`,
+    scriptExists: true,
+    eventsPath: `${base}/hook-events.jsonl`,
+    installed: true,
+    lastEventAt: Date.now() - 4 * 60_000,
+    targets: ["codebuddy", "workbuddy", "workbuddy-ai"].map((label) => ({
+      label,
+      path: `/demo/.${label}/settings.json`,
+      exists: true,
+      installed: true,
+    })),
+  };
 }
 
 function checkinLogs(): CheckinLog[] {
@@ -365,6 +424,46 @@ function demoTokenGroup(key: string, input: number, output: number, cacheRead: n
 function demoTokenSession(key: string, title: string, project: string, input: number, output: number, cacheRead: number, cacheWrite: number, records: number): TokenStatsGroup {
   const keyParts = key.split(" · ");
   return { ...demoTokenGroup(key, input, output, cacheRead, cacheWrite, records), title, project, sessionId: keyParts[keyParts.length - 1] };
+}
+
+/** 演示用请求明细：约 120 条，时间戳落在最近 14 天内且按时间倒序。 */
+function demoTokenRequests(scale: number): TokenStatsRequestRow[] {
+  const models = ["deepseek-v4-flash", "deepseek-v4-flash", "kimi-k3-1", "deepseek-v4-flash", "glm-5.2"];
+  const sessions = [
+    { project: "wb-switch-rust", sessionId: "token-stats-dashboard", title: "完善 Token 统计仪表盘与本地用量分析" },
+    { project: "wb-switch-rust", sessionId: "account-card-redesign", title: "统一账号卡片视觉和交互" },
+    { project: "my-code-teams", sessionId: "settings-agent-acp", title: "设计 Agent 与 ACP 管理设置" },
+    { project: "LetterTotTown", sessionId: "character-audio", title: "补全角色成语双音频" },
+  ];
+  // 每天 9 条、小时降序，保证整体严格倒序（最新在前）；从昨天开始，
+  // 避免演示时间戳落在当前时刻之后。
+  const hours = [23, 21, 20, 17, 16, 15, 14, 11, 10];
+
+  return Array.from({ length: 120 }, (_, index) => {
+    const session = sessions[Math.floor(index / 3) % sessions.length];
+    const factor = 0.55 + ((index * 37) % 23) / 20;
+    const input = Math.round(310_000 * factor * scale);
+    const cacheRead = Math.round(input * 0.87);
+    const output = Math.round(20_000 * factor * scale);
+    const cacheWrite = index % 4 === 0 ? 0 : Math.round(4_000 * factor * scale);
+    // 思考过程是 output 的子集：比例随行变化，保证 thinking <= output。
+    const thinking = Math.round(output * [0.34, 0.12, 0.05, 0.41, 0.22][index % 5]);
+    return {
+      timestamp: atLocalTime(Math.floor(index / 9) + 1, hours[index % 9], (index * 13) % 60),
+      model: models[index % models.length],
+      project: session.project,
+      sessionId: session.sessionId,
+      title: session.title,
+      input,
+      output,
+      cacheRead,
+      cacheWrite,
+      // 与后端明细行同口径：input 已含 cacheRead，未命中部分为两者之差。
+      uncachedInput: Math.max(0, input - cacheRead),
+      thinking,
+      total: input + output + cacheWrite,
+    };
+  });
 }
 
 function demoTokenSource(source: TokenStatsSource["source"], scale: number): TokenStatsSource {
@@ -395,11 +494,34 @@ function demoTokenSource(source: TokenStatsSource["source"], scale: number): Tok
     demoTokenSession("wb-switch-rust · account-card-redesign", "统一账号卡片视觉和交互", "wb-switch-rust", 6_300_000 * scale, 410_000 * scale, 5_400_000 * scale, 50_000 * scale, Math.round(29 * scale)),
   ];
   const now = Date.now();
-  return { source, summary, models, projects, sessions, daily, hours, filesScanned: source === "workbuddy" ? 63 : source === "codebuddy-ide" ? 17 : 41, parseErrors: 0, coverageStartAt: now - 13 * 86_400_000, coverageEndAt: now };
+  return {
+    source, summary, models, projects, sessions, daily, hours,
+    filesScanned: source === "workbuddy" ? 63 : source === "codebuddy-ide" ? 17 : 41,
+    parseErrors: 0,
+    coverageStartAt: now - 13 * 86_400_000,
+    coverageEndAt: now,
+    // 只有 CodeBuddy CLI 来源返回请求明细，与真实后端行为一致。
+    ...(source === "codebuddy-cli" ? { requests: demoTokenRequests(scale) } : {}),
+  };
+}
+
+/** 国际版数据源：演示环境不构造数据，保持真实的「空集」形态（页面显示空状态）。 */
+function emptyTokenSource(source: TokenStatsSource["source"]): TokenStatsSource {
+  return {
+    source,
+    summary: demoTokenTotals(0, 0, 0, 0, 0),
+    models: [],
+    projects: [],
+    sessions: [],
+    daily: [],
+    hours: [],
+    filesScanned: 0,
+    parseErrors: 0,
+  };
 }
 
 function demoTokenStatistics(days?: number): TokenStatistics {
-  return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), demoTokenSource("codebuddy-cli", 0.58), demoTokenSource("codebuddy-ide", 0.36)] };
+  return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), emptyTokenSource("workbuddy-ai"), demoTokenSource("codebuddy-cli", 0.58), demoTokenSource("codebuddy-ide", 0.36)] };
 }
 
 /** Read-only demo response provider. It never reads or mutates real user data. */
@@ -408,19 +530,80 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
   const appStatus: AppStatus = { running: true, authFile: "/demo/workbuddy/auth.json", current: { uid: demoAccounts[0].uid, nickname: demoAccounts[0].nickname, email: demoAccounts[0].email }, appPath: "/demo/WorkBuddy.app", version: "0.1.24" };
   const activeIndex = Math.max(0, demoAccounts.findIndex((account) => account.id === demoActiveCliAccountId));
   const activeAccount = demoAccounts[activeIndex] ?? demoAccounts[0];
-  const cliStatus: CodeBuddyCliStatus = { configured: true, settingsPresent: true, helperPresent: true, helperSupportsAccountIds: true, activeIndex, activeAccountId: activeAccount.id, activeAccountName: activeAccount.nickname, accountCount: demoAccounts.length, statePath: "/demo/codebuddy-cli-state.json" };
+  const cliStatus: CodeBuddyCliStatus = { configured: true, settingsPresent: true, helperPresent: true, helperSupportsAccountIds: true, activeIndex, activeAccountId: activeAccount.id, activeAccountName: activeAccount.nickname, activeAccountVariant: accountVariant(activeAccount), accountCount: demoAccounts.length, statePath: "/demo/codebuddy-cli-state.json" };
   const config = rotateConfig();
   const rotateStatus: RotateStatus = { config, cliConfigured: true, activeAccountId: demoAccounts[0].id, activeAccountName: demoAccounts[0].nickname, lastCheckAt: atLocalTime(0, 9, 30), lastSwitchAt: atLocalTime(1, 16, 20) };
   const githubConfig: GithubConfig = { owner: "zhangjia", repo: "wb-switch", proxy: "" };
   switch (command) {
-    case "get_status": return appStatus;
+    // 档位随请求回显：演示数据本身只有国内版账号，国际版展示空状态。
+    case "get_status": {
+      const variant = normalizeVariant(args?.variant);
+      return variant === "ai"
+        ? {
+            ...appStatus,
+            running: false,
+            current: null,
+            authFile: "/demo/workbuddy-ai/auth.json",
+            appPath: "/demo/WorkBuddy AI.app",
+            variant,
+          }
+        : { ...appStatus, variant };
+    }
     case "get_accounts": return { accounts: demoAccounts };
     case "get_codebuddy_cli_status": return cliStatus;
+    // 让演示里存在一个「CodeBuddy IDE 当前账号」：否则 IDE 标记与选中态染色（淡紫）在演示里永远不可见。
+    // 取第二个账号，使三张卡各自演示一种形态（A 占位行 / B IDE 选中 / C 查看全部）。
+    case "get_codebuddy_cn_ide_status": return {
+      installed: true,
+      running: true,
+      dataDir: "/demo/codebuddy-cn-ide",
+      dbPath: "/demo/codebuddy-cn-ide/state.vscdb",
+      dbExists: true,
+      appPath: "/demo/CodeBuddy CN.app",
+      activeAccountId: demoAccounts[1].id,
+      activeAccountName: demoAccounts[1].nickname,
+    } satisfies CodeBuddyCnIdeStatus;
+    // 国际版同理：不 mock 会让演示切到「国际版」时落到 default → throw（被 AccountsPage 的
+    // try/catch 吞掉），IDE 标记退化成「未接入」——而这正是本轮国际版 IDE 功能在演示页的展示面。
+    case "get_codebuddy_ide_status": return {
+      installed: true,
+      running: true,
+      dataDir: "/demo/codebuddy-ide",
+      dbPath: "/demo/codebuddy-ide/state.vscdb",
+      dbExists: true,
+      appPath: "/demo/CodeBuddy IDE.app",
+      activeAccountId: demoAccounts[1].id,
+      activeAccountName: demoAccounts[1].nickname,
+    } satisfies CodeBuddyCnIdeStatus;
+    case "get_vscode_ext_status": return {
+      installed: true,
+      extensionInstalled: true,
+      running: false,
+      loggedIn: true,
+      dataDir: "/demo/Code",
+      dbPath: "/demo/Code/User/globalStorage/state.vscdb",
+      dbExists: true,
+      activeAccountId: demoAccounts[0].id,
+      activeAccountName: demoAccounts[0].nickname,
+      detectedFrom: "state",
+      statePath: "/demo/vscode_ext.json",
+    } satisfies VscodeExtStatus;
+    case "list_vscode_sessions": return {
+      sourceUid: demoAccounts[0].uid,
+      skipped: 0,
+      dataRoot: "/demo/CodeBuddyExtension/Data",
+      sessions: [
+        { id: "7f3a91c0d4e5b6a7c8d9e0f1a2b3c4d5", workspaceHash: "3c1f8a92b4d5e60718f9a0b1c2d3e4f5", title: "完善账号卡片交互", updatedAt: Date.now() - 1000 * 60 * 12, type: "craft", hasHistory: true },
+        { id: "9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e", workspaceHash: "3c1f8a92b4d5e60718f9a0b1c2d3e4f5", title: "修复切换后历史为空", updatedAt: Date.now() - 1000 * 60 * 60 * 3, type: "craft", hasHistory: true },
+        { id: "11223344556677889900112233445566", workspaceHash: "aabbccddeeff00112233445566778899", title: "设计会话复制方案", updatedAt: Date.now() - 1000 * 60 * 60 * 26, type: "craft", hasHistory: true },
+        { id: "66554433221100998877665544332211", workspaceHash: "aabbccddeeff00112233445566778899", title: "(无标题)", updatedAt: Date.now() - 1000 * 60 * 60 * 50, type: "craft", hasHistory: false },
+      ],
+    } satisfies VscodeSessionList;
     case "switch_codebuddy_cli_account": {
       const target = demoAccounts.find((account) => account.id === args?.accountId);
       if (!target) throw new Error("账号不存在");
       demoActiveCliAccountId = target.id;
-      return { ok: true, configured: true, synced: true, verified: true, activeIndex: demoAccounts.indexOf(target), activeAccountId: target.id, message: "演示切换已完成" } satisfies CodeBuddyCliSwitchResult;
+      return { ok: true, configured: true, synced: true, verified: true, activeIndex: demoAccounts.indexOf(target), activeAccountId: target.id, regionChanged: false, cliClosed: false, closedProcessCount: 0, message: "演示切换已完成" } satisfies CodeBuddyCliSwitchResult;
     }
     case "get_checkin_status": return { ok: true, todayCheckedIn: true };
     case "get_credit_expiry": return creditExpiry(String(args?.accountId ?? ""));
@@ -429,6 +612,9 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_auto_checkin_config": return checkinConfig();
     case "get_checkin_logs": return { logs: checkinLogs() };
     case "get_travel_status": return travelStatus(String(args?.accountId ?? ""));
+    case "get_rate_limits": return rateLimits();
+    case "get_rate_limit_hook_status": return rateLimitHookStatus();
+    case "get_rate_limit_config": return { enabled: true };
     case "get_auto_travel_config": return travelConfig();
     case "get_auto_rotate_config": return config;
     case "rotate_status": return rotateStatus;
