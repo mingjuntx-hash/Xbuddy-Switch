@@ -46,7 +46,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYwNEU4RkQ5OEZCN0FGRApSV1Q5ZXZ1WS9lZ0VEd1VuVFpOYjU1OGJGd1NmMVhaWHJTSEdnNVRSSEcweUxWR05TN0h2WnloSwo=",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYyRkY3QzkyQzcxMEJDMjQKUldRa3ZCREhrbnovOHUveDhpSk5yRlZ1bmsybS9OVFRRYllYWFhVNHRTRHZoamk0WWY4UG5iRFgK",
       "endpoints": [
         "https://github.com/mingjuntx-hash/Xbuddy-Switch/releases/latest/download/latest.json",
         "https://github.com/mingjuntx-hash/Xbuddy-Switch/releases/latest/download/latest-{{target}}-{{arch}}.json",

@@ -24,6 +24,31 @@ npm run build:app:release  # 构建 release .app + 签名更新包
 4. `python3 scripts/merge-update-manifests.py <产物目录>` 合并为 `latest.json`，并把 Windows 平台项写入 `latest-macos-x86_64.json`（兼容已安装的 Windows 客户端）
 5. 将安装包、签名更新包、`latest*.json` 一并上传到 GitHub Release
 
+### 签名密钥（本仓库自己的，2026-09-24 生成）
+
+本仓库**不再使用上游作者的密钥**。当前公钥 keyid = `F2FF7C92C710BC24`，
+已写入 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`。
+
+| 项 | 位置 |
+|---|---|
+| 公钥 | `src-tauri/tauri.conf.json`（公开，随代码走） |
+| 私钥 | `~/.wb-switch/wb-switch-updater.key`（在**仓库目录之外**，正常无法被提交；`.gitignore` 另有 `*.key` 防御性规则） |
+| 私钥密码 | `wb-switch-dev`（与 `package.json` 的 `build:app*` 脚本一致） |
+
+CI 发版（`.github/workflows/build.yml`）还需要在
+**仓库 Settings → Secrets and variables → Actions** 配置：
+
+| 名称 | 类型 | 值 |
+|---|---|---|
+| `TAURI_SIGNING_PRIVATE_KEY` | Secret | 私钥文件**全文** |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Secret | `wb-switch-dev` |
+| `NPM_TOKEN` | Secret | npm 发布用；不发 npm 就改配下面那个变量 |
+| `PUBLISH_NPM` | **Variable** | 设为 `false` 可跳过 npm 发布（缺 NPM_TOKEN 时必设，否则 tag 发版会先挂在 npm 那步） |
+
+⚠️ **换密钥的后果**：`pubkey` 一旦变更，所有已安装的旧客户端都再也无法通过新包的签名校验
+（因为校验用的是**客户端内置**的公钥）。所以**除非必要不要轮换**；
+真要轮换，就得同时接受「老用户必须手动重装一次」。
+
 ### npm 版（webui）发布
 
 1. 编译 server 二进制并上传 GitHub Release（`.github/workflows/build.yml` 自动执行）

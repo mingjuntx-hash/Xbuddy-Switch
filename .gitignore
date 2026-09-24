@@ -51,3 +51,6 @@ src-tauri/gen/
 
 # 上游的开发工作流说明（本地不需要）
 /AGENTS.md
+# updater 签名私钥 —— 绝不入库（正常位置在 ~/.wb-switch/，这里是防御性规则）
+*.key
+*.key.pub
