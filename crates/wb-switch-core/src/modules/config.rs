@@ -705,7 +705,12 @@ fn merge_newbie_config(input: &Value) -> Value {
     let Some(map) = input.as_object() else {
         return merged;
     };
-    for key in ["enabled", "auto_bind_on_add", "auto_accept_tasks", "auto_claim_tasks"] {
+    for key in [
+        "enabled",
+        "auto_bind_on_add",
+        "auto_accept_tasks",
+        "auto_claim_tasks",
+    ] {
         if let Some(v) = map.get(key).and_then(Value::as_bool) {
             merged[key] = json!(v);
         }

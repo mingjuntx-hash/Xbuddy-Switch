@@ -902,9 +902,15 @@ fn format_checkin_tooltip(value: &Value) -> String {
 mod tests {
     use super::{
         format_checkin_tooltip, is_silent_startup, should_activate_on_second_launch,
-        should_keep_tray_alive, should_wake_main_window, tray_icon, tray_icon_variant, MouseButton,
+        should_keep_tray_alive, should_wake_main_window, tray_icon_variant, MouseButton,
         MouseButtonState, TrayIconVariant,
     };
+    // 这两个只在对应平台的测试里用到；写进上面的共用列表会在别的平台上
+    // 变成 unused import，而 clippy 带 -D warnings 时那是硬错误。
+    #[cfg(windows)]
+    use super::taskbar_uses_light_theme;
+    #[cfg(target_os = "macos")]
+    use super::tray_icon;
     use serde_json::json;
 
     #[test]
@@ -938,7 +944,14 @@ mod tests {
     fn tray_icon_is_colored_on_transparent_background() {
         let icon = tray_icon();
         assert_eq!((icon.width(), icon.height()), (32, 32));
-        let px: Vec<&[u8]> = icon.rgba().chunks_exact(4).collect();
+        // chunks_exact(4) 在 1.98 的 clippy 下会报；改用 as_chunks::<4>()（与 macOS 分支一致）。
+        let px: Vec<&[u8]> = icon
+            .rgba()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| p.as_slice())
+            .collect();
         assert!(px.iter().any(|p| p[3] == 255), "应存在不透明像素");
         assert!(
             px.iter().any(|p| p[3] == 0),

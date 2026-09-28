@@ -929,10 +929,8 @@ mod tests {
     /// 备注写入：值可读回、其余字段（含凭据）不动。
     #[test]
     fn note_round_trips_and_keeps_other_fields() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "wb-switch-note-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let test_dir =
+            std::env::temp_dir().join(format!("wb-switch-note-{}", uuid::Uuid::new_v4().simple()));
         let path = test_dir.join("accounts.json");
         let accounts = vec![account("account-1", Some("uid-1"), "徐", None)];
         save_accounts_to_path(&path, &accounts).unwrap();
@@ -944,7 +942,11 @@ mod tests {
         let persisted = load_accounts_from_path(&path);
         let row = find_account_in(&persisted, "account-1").unwrap();
         assert_eq!(row["note"], json!("画室主号 · 主力"));
-        assert_eq!(row["access_token"], json!("token-account-1"), "凭据不得被改动");
+        assert_eq!(
+            row["access_token"],
+            json!("token-account-1"),
+            "凭据不得被改动"
+        );
         assert_eq!(row["uid"], json!("uid-1"));
 
         // account_meta 也要下发该字段

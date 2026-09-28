@@ -28,7 +28,8 @@ pub fn workbuddy_app_path(variant: WbVariant) -> PathBuf {
         if let Some(exe) = crate::modules::process::windows_workbuddy_exe_path(variant) {
             return exe;
         }
-        return crate::modules::process::windows_default_app_path(variant);
+        // 只留 `exe` 那条提前返回；末行改为块尾表达式（1.98 的 needless_return）。
+        crate::modules::process::windows_default_app_path(variant)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

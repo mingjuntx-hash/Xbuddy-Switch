@@ -881,7 +881,10 @@ pub async fn run_newbie_for_account(
     bind_invite: Option<bool>,
 ) -> Result<Value, String> {
     let account = account::find_account(&account_id).ok_or("账号不存在")?;
-    Ok(crate::modules::growth::run_newbie_for_account(&account, bind_invite.unwrap_or(false)).await)
+    Ok(
+        crate::modules::growth::run_newbie_for_account(&account, bind_invite.unwrap_or(false))
+            .await,
+    )
 }
 
 /// POST /api/newbie/run-all —— 对所有账号跑一遍（默认不重复绑定邀请码）。
@@ -1072,7 +1075,11 @@ pub fn open_external_url(url: String) -> Result<(), String> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
         std::process::Command::new(opener)
             .arg(trimmed)
             .spawn()

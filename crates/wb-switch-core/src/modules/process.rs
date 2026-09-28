@@ -1275,7 +1275,9 @@ mod tests {
         assert!(!args_mention_self(
             "/Applications/CodeBuddy.app/Contents/MacOS/CodeBuddy"
         ));
-        assert!(!args_mention_self("/bin/zsh -c 'echo WORKBUDDY.APP mention'"));
+        assert!(!args_mention_self(
+            "/bin/zsh -c 'echo WORKBUDDY.APP mention'"
+        ));
     }
 
     #[test]
@@ -1288,10 +1290,7 @@ mod tests {
             "workbuddy-switch.exe",
             WbVariant::Cn
         ));
-        assert!(!is_workbuddy_image_name(
-            "xbuddy-switch.exe",
-            WbVariant::Cn
-        ));
+        assert!(!is_workbuddy_image_name("xbuddy-switch.exe", WbVariant::Cn));
         assert!(!is_workbuddy_image_name("wb-switch", WbVariant::Cn));
         assert!(!is_workbuddy_image_name(
             "WorkBuddy Helper.exe",

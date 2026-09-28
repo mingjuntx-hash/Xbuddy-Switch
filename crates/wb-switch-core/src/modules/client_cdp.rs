@@ -52,7 +52,11 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
             .map_err(|e| format!("地址解析失败: {e}"))?,
         CONNECT_TIMEOUT,
     )
-    .map_err(|e| format!("连接 127.0.0.1:{port} 失败（客户端是否带 --remote-debugging-port={port} 启动？）: {e}"))?;
+    .map_err(|e| {
+        format!(
+            "连接 127.0.0.1:{port} 失败（客户端是否带 --remote-debugging-port={port} 启动？）: {e}"
+        )
+    })?;
     stream.set_read_timeout(Some(Duration::from_secs(8))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(8))).ok();
 
@@ -94,9 +98,9 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
 
     if let Some(len) = clen {
         while raw.len() < header_end + len {
-            let n = stream
-                .read(&mut tmp)
-                .map_err(|e| format!("读取响应体失败（已收 {} 字节，期望 {len}）: {e}", raw.len()))?;
+            let n = stream.read(&mut tmp).map_err(|e| {
+                format!("读取响应体失败（已收 {} 字节，期望 {len}）: {e}", raw.len())
+            })?;
             if n == 0 {
                 break;
             }
@@ -198,8 +202,7 @@ impl Ws {
         let mut hasher = Sha1::new();
         hasher.update(key.as_bytes());
         hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-        let expected_accept =
-            base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let expected_accept = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
 
         let req = format!(
             "GET {path} HTTP/1.1\r\n\
@@ -312,7 +315,11 @@ impl Ws {
                 let b = self.read_exact(8)?;
                 len = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
             }
-            let mask = if masked { Some(self.read_exact(4)?) } else { None };
+            let mask = if masked {
+                Some(self.read_exact(4)?)
+            } else {
+                None
+            };
             let mut payload = if len > 0 {
                 self.read_exact(len as usize)?
             } else {
@@ -353,13 +360,7 @@ impl Cdp {
     pub fn connect_main_page(port: u16) -> Result<(Self, Value), String> {
         let (ws_url, target) = find_main_page(port)?;
         let ws = Ws::connect(&ws_url)?;
-        Ok((
-            Cdp {
-                ws,
-                next_id: 0,
-            },
-            target,
-        ))
+        Ok((Cdp { ws, next_id: 0 }, target))
     }
 
     pub fn call(&mut self, method: &str, params: Option<Value>) -> Result<Value, String> {
@@ -465,12 +466,8 @@ pub fn probe(port: u16) -> Value {
     match Cdp::connect_main_page(port) {
         Ok((mut cdp, target)) => {
             let probe_val = cdp.eval_json(PROBE_JS).unwrap_or(Value::Null);
-            let title = cdp
-                .evaluate("document.title")
-                .unwrap_or(Value::Null);
-            let url = cdp
-                .evaluate("location.href")
-                .unwrap_or(Value::Null);
+            let title = cdp.evaluate("document.title").unwrap_or(Value::Null);
+            let url = cdp.evaluate("location.href").unwrap_or(Value::Null);
             json!({
                 "ok": true,
                 "port": port,
@@ -486,7 +483,7 @@ pub fn probe(port: u16) -> Value {
             "port": port,
             "error": e,
             "hint": format!("请让 WorkBuddy 带 --remote-debugging-port={port} 启动；\
-若客户端已在运行，需要先完全退出再带参数重启。"),
+        若客户端已在运行，需要先完全退出再带参数重启。"),
         }),
     }
 }
@@ -689,7 +686,11 @@ mod live_tests {
                     "Input.insertText",
                     Some(json!({ "text": "任务自动化连通性测试" })),
                 );
-                println!("  c) insertText {:?}  ({:?})", ins.map(|_| "ok"), t.elapsed());
+                println!(
+                    "  c) insertText {:?}  ({:?})",
+                    ins.map(|_| "ok"),
+                    t.elapsed()
+                );
 
                 let t = Instant::now();
                 let got = cdp.evaluate(
@@ -703,7 +704,11 @@ mod live_tests {
 
                 let t = Instant::now();
                 let ent = press_enter(&mut cdp);
-                println!("  e) Enter      {:?}  ({:?})", ent.map(|_| "ok"), t.elapsed());
+                println!(
+                    "  e) Enter      {:?}  ({:?})",
+                    ent.map(|_| "ok"),
+                    t.elapsed()
+                );
             }
             Err(e) => println!("FAIL connect: {e}"),
         }

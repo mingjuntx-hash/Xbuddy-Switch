@@ -62,10 +62,7 @@ pub fn task_plan(code: &str) -> (Action, Vec<&'static str>) {
         "Expert_team_use_3" => (Action::Chat, vec!["召唤专家团"]),
         "automation_1" => (Action::Chat, vec!["帮我创建一个每天定时执行的自动化任务"]),
         "playbook_prompt" => (Action::Chat, vec!["给我一些创作灵感"]),
-        "create_canvas" => (
-            Action::Chat,
-            vec!["用设计创意模式帮我画一只小柴犬头像"],
-        ),
+        "create_canvas" => (Action::Chat, vec!["用设计创意模式帮我画一只小柴犬头像"]),
         // ---- 需界面操作（列出但不自动） ----
         "Library_read"
         | "Hp_Appearance"
@@ -229,7 +226,11 @@ pub async fn run(only: Option<Vec<String>>, dry_run: bool) -> Value {
         return json!({"ok": false, "stage": "account", "error": acc});
     }
     let info = acc.get("v").cloned().unwrap_or(json!({}));
-    let uid = info.get("uid").and_then(Value::as_str).unwrap_or("").to_string();
+    let uid = info
+        .get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let Some(local) = match_local_account(&uid) else {
         return json!({
             "ok": false,
@@ -297,11 +298,10 @@ pub async fn run(only: Option<Vec<String>>, dry_run: bool) -> Value {
         } else {
             for p in prompts {
                 let text = p.to_string();
-                let res = tokio::task::spawn_blocking(move || {
-                    client_cdp::send_message(port, &text)
-                })
-                .await
-                .unwrap_or_else(|e| Err(format!("任务线程异常: {e}")));
+                let res =
+                    tokio::task::spawn_blocking(move || client_cdp::send_message(port, &text))
+                        .await
+                        .unwrap_or_else(|e| Err(format!("任务线程异常: {e}")));
 
                 match res {
                     Ok(m) => {

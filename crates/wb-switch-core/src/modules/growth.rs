@@ -206,13 +206,7 @@ pub async fn fetch_invite_progress(account: &Value) -> Value {
 
 /// 拉取成长计划任务列表（原始响应）。
 pub async fn fetch_growth_tasks(account: &Value) -> Value {
-    growth_request(
-        &format!("{GROWTH_API_PREFIX}/tasks"),
-        "GET",
-        None,
-        account,
-    )
-    .await
+    growth_request(&format!("{GROWTH_API_PREFIX}/tasks"), "GET", None, account).await
 }
 
 /// 拉取成长等级信息。
@@ -241,13 +235,7 @@ pub async fn accept_growth_tasks(account: &Value, codes: &[String]) -> Value {
         return json!({"ok": true, "accepted": 0, "message": "没有待接受的任务"});
     }
     let path = format!("{GROWTH_API_PREFIX}/tasks/accept");
-    let resp = growth_request(
-        &path,
-        "POST",
-        Some(json!({ "task_codes": codes })),
-        account,
-    )
-    .await;
+    let resp = growth_request(&path, "POST", Some(json!({ "task_codes": codes })), account).await;
     json!({
         "ok": resp_ok(&resp),
         "accepted": if resp_ok(&resp) { codes.len() } else { 0 },
@@ -299,20 +287,20 @@ pub fn summarize_tasks(tasks: &[Value]) -> Value {
 
         match st {
             ST_COMPLETED => earnable += credit,
-            ST_NOT_ACCEPTED | ST_ACCEPTED | ST_IN_PROGRESS => {
-                if tgt == 0 || cur < tgt {
-                    pending_credit += credit;
-                    pending.push(json!({
-                        "taskCode": t.get("task_code").and_then(Value::as_str).unwrap_or(""),
-                        "title": t.get("title").and_then(Value::as_str).unwrap_or(""),
-                        "credit": credit,
-                        "acceptStatus": st,
-                        "current": cur,
-                        "target": tgt,
-                        "jumpUrl": t.get("jump_url").and_then(Value::as_str).unwrap_or(""),
-                        "description": t.get("description").and_then(Value::as_str).unwrap_or(""),
-                    }));
-                }
+            // 只有未达标的才计入待办。1.98 的 clippy::collapsible_match 要求把这个 if
+            // 提到 match 守卫上；守卫不成立时落进 `_ => {}`，与原先「进臂后 if 为假」等价。
+            ST_NOT_ACCEPTED | ST_ACCEPTED | ST_IN_PROGRESS if tgt == 0 || cur < tgt => {
+                pending_credit += credit;
+                pending.push(json!({
+                    "taskCode": t.get("task_code").and_then(Value::as_str).unwrap_or(""),
+                    "title": t.get("title").and_then(Value::as_str).unwrap_or(""),
+                    "credit": credit,
+                    "acceptStatus": st,
+                    "current": cur,
+                    "target": tgt,
+                    "jumpUrl": t.get("jump_url").and_then(Value::as_str).unwrap_or(""),
+                    "description": t.get("description").and_then(Value::as_str).unwrap_or(""),
+                }));
             }
             _ => {}
         }
@@ -388,9 +376,7 @@ pub async fn run_newbie_for_account(account: &Value, bind_invite: bool) -> Value
     if auto_accept {
         let to_accept: Vec<String> = tasks
             .iter()
-            .filter(|t| {
-                t.get("accept_status").and_then(Value::as_str) == Some(ST_NOT_ACCEPTED)
-            })
+            .filter(|t| t.get("accept_status").and_then(Value::as_str) == Some(ST_NOT_ACCEPTED))
             .filter_map(|t| {
                 t.get("task_code")
                     .and_then(Value::as_str)
@@ -527,7 +513,10 @@ pub async fn run_newbie_all(bind_invite: bool) -> Value {
         let sem = std::sync::Arc::clone(&sem);
         set.spawn(async move {
             let Ok(_permit) = sem.acquire().await else {
-                return (idx, json!({"ok": false, "account": "?", "reason": "semaphore_closed"}));
+                return (
+                    idx,
+                    json!({"ok": false, "account": "?", "reason": "semaphore_closed"}),
+                );
             };
             let r = run_newbie_for_account(&acc, bind_invite).await;
             (idx, r)
