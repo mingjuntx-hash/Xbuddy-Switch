@@ -1,9 +1,11 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod commands;
+mod companion;
 #[cfg(target_os = "macos")]
 mod instance_lock;
 #[cfg(desktop)]
 mod tray;
+mod update_service;
 
 use std::time::Duration;
 use tauri::Emitter;
@@ -103,6 +105,11 @@ fn spawn_background_loops(app: tauri::AppHandle) {
         }
     });
 
+    // 统一更新服务：首次 15 秒后检查一次，之后每 30 分钟（未带 force，走 core 的
+    // 6 小时缓存）。检查由 Rust 常驻，替代前端 30 分钟轮询：轻量模式 / 主窗口关闭时
+    // 同样在跑，托盘菜单随时反映最新阶段。
+    update_service::spawn_periodic_check(app.clone());
+
     // 限额 hook 信号：轮询 `~/.wb-switch/hook-events.jsonl`（CLI / WorkBuddy 的 429 当轮
     // 由客户端 hook 追加），入账后通知前端立即拉取。轻量模式下窗口销毁但进程仍在，
     // 状态由后端持有（见 `rate_limit_events.rs`）。
@@ -139,6 +146,11 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init());
+
+    #[cfg(desktop)]
+    if !is_screenshot_demo() {
+        builder = builder.plugin(agent_studio_desktop::init(companion::config()));
+    }
 
     #[cfg(desktop)]
     {
@@ -182,6 +194,8 @@ pub fn run() {
             commands::get_codebuddy_cn_ide_status,
             commands::switch_codebuddy_cn_ide_account,
             commands::detect_codebuddy_cn_ide_account,
+            commands::list_codebuddy_ide_sessions,
+            commands::codebuddy_ide_session_links_preview,
             commands::get_vscode_ext_status,
             commands::switch_vscode_ext_account,
             commands::detect_vscode_ext_account,
@@ -189,7 +203,12 @@ pub fn run() {
             commands::vscode_session_links_preview,
             commands::get_codebuddy_ide_status,
             commands::switch_codebuddy_ide_account,
+            commands::list_codebuddy_intl_ide_sessions,
+            commands::codebuddy_intl_ide_session_links_preview,
             commands::detect_codebuddy_ide_account,
+            commands::get_jetbrains_status,
+            commands::switch_jetbrains_account,
+            commands::detect_jetbrains_account,
             commands::delete_account,
             commands::oauth_start,
             commands::oauth_status,
@@ -244,12 +263,21 @@ pub fn run() {
             commands::save_github_config,
             commands::check_update,
             commands::open_external_url,
+            commands::update_state,
+            commands::update_download,
+            commands::update_restart,
             commands::relaunch_app,
             commands::get_launch_at_login_enabled,
             commands::set_launch_at_login_enabled,
             commands::record_notification,
             commands::list_notifications,
             commands::clear_notifications,
+            commands::log_error,
+            commands::get_error_log_path,
+            commands::reveal_error_log,
+            companion::get_companion_enabled,
+            companion::set_companion_enabled,
+            companion::open_companion_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

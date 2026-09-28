@@ -1,18 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import {
-  ChevronDown,
-  ChevronRight,
-  CircleCheck,
-  Loader2,
-  RefreshCw,
-  TriangleAlert,
-} from "lucide-react";
+import { CircleCheck, Loader2, RefreshCw, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -21,11 +12,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Separator } from "@/components/ui/separator";
-import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { buildGroups, SessionCopyTab } from "@/components/session-copy-tab";
 import type { SessionLinksMeta } from "@/components/session-link-shared";
 import { VscodeSessionSyncSection } from "@/components/vscode-session-sync-section";
 import * as api from "@/lib/api";
@@ -322,92 +312,19 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
 
   // 「复制会话」tab 内容：勾选即意图，提交结果由底部摘要兜底确认。
   const copyTabContent = (
-    <>
-      <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
-        <div className="min-w-0 flex-1">
-          <div className="text-sm font-medium">复制会话到目标账号</div>
-          {loadingSessions ? (
-            // 单行高度对齐真实提示文案（实测常见态折一行，16px），加载完成后不跳高度。
-            <Skeleton className="h-4 w-3/4" aria-hidden="true" />
-          ) : (
-            <div
-              className={
-                !hasCopyable ? "text-xs text-amber-700 dark:text-amber-400" : "text-xs text-muted-foreground"
-              }
-            >
-              {emptyHint}
-            </div>
-          )}
-        </div>
-        <Switch
-          checked={copyEnabled}
-          onCheckedChange={setCopyEnabled}
-          disabled={loadingSessions || !hasCopyable}
-          aria-label="复制会话到目标账号"
-        />
-      </div>
-
-      {copyEnabled && (
-        <>
-          <Separator />
-          <div className="max-h-[min(20rem,45vh)] overflow-y-auto pr-1">
-            {loadingSessions ? (
-              <div className="space-y-2 py-1">
-                <Skeleton className="h-9 w-full" />
-                <Skeleton className="h-9 w-full" />
-                <Skeleton className="h-9 w-full" />
-              </div>
-            ) : (
-              groups.map((group) => {
-                const open_ = !collapsed.has(group.key);
-                const ids = group.sessions.map((s) => s.id);
-                const state = selectionState(ids, selected);
-                return (
-                  <div key={group.key} className="mb-0.5">
-                    <div className="sticky top-0 z-10 flex items-center gap-1.5 rounded-md bg-background px-1.5 py-1">
-                      <TreeCheckbox
-                        allOn={state.allOn}
-                        someOn={state.someOn}
-                        onChange={() => toggleGroup(ids)}
-                        ariaLabel={`选择${group.label}`}
-                      />
-                      <button
-                        type="button"
-                        className="flex min-w-0 flex-1 items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-accent/50"
-                        onClick={() => toggleCollapsed(group.key)}
-                        aria-expanded={open_}
-                        aria-label={`${open_ ? "折叠" : "展开"}${group.label}`}
-                      >
-                        <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                          {group.label}
-                          <span className="ml-1 font-normal text-muted-foreground">
-                            #{group.hash.slice(0, 8)} · {group.sessions.length}
-                          </span>
-                        </span>
-                        {open_ ? (
-                          <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
-                        ) : (
-                          <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
-                        )}
-                      </button>
-                    </div>
-                    {open_ &&
-                      group.sessions.map((session) => (
-                        <SessionRow
-                          key={session.id}
-                          session={session}
-                          checked={selected.has(session.id)}
-                          onToggle={() => toggleSession(session.id)}
-                        />
-                      ))}
-                  </div>
-                );
-              })
-            )}
-          </div>
-        </>
-      )}
-    </>
+    <SessionCopyTab
+      loading={loadingSessions}
+      hint={emptyHint}
+      hasCopyable={hasCopyable}
+      enabled={copyEnabled}
+      onEnabledChange={setCopyEnabled}
+      groups={groups}
+      selected={selected}
+      onToggleSession={toggleSession}
+      onToggleGroup={toggleGroup}
+      collapsed={collapsed}
+      onToggleCollapsed={toggleCollapsed}
+    />
   );
 
   return (
@@ -574,41 +491,6 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
   );
 }
 
-interface WorkspaceGroup {
-  key: string;
-  label: string;
-  hash: string;
-  sessions: VscodeSession[];
-}
-
-/** 按工作区 hash 分组，仅保留含正文的会话；分组按最近活动时间降序。 */
-function buildGroups(sessions: VscodeSession[]): WorkspaceGroup[] {
-  const byHash = new Map<string, VscodeSession[]>();
-  for (const session of sessions) {
-    if (!session.hasHistory) continue;
-    const list = byHash.get(session.workspaceHash);
-    if (list) list.push(session);
-    else byHash.set(session.workspaceHash, [session]);
-  }
-  const entries = [...byHash.entries()];
-  entries.sort((left, right) => maxUpdatedAt(right[1]) - maxUpdatedAt(left[1]));
-  return entries.map(([hash, list], index) => ({
-    key: hash,
-    hash,
-    label: `工作区 #${index + 1}`,
-    sessions: [...list].sort((left, right) => right.updatedAt - left.updatedAt),
-  }));
-}
-
-function maxUpdatedAt(sessions: VscodeSession[]): number {
-  return sessions.reduce((max, session) => Math.max(max, session.updatedAt || 0), 0);
-}
-
-function selectionState(ids: string[], selected: Set<string>) {
-  const count = ids.filter((id) => selected.has(id)).length;
-  return { allOn: ids.length > 0 && count === ids.length, someOn: count > 0 && count < ids.length };
-}
-
 /** 统一空态文案：区分未装 VS Code / 未装扩展 / 未找到数据目录 / 未登录 / 无会话。 */
 function emptyStateHint(
   status: VscodeExtStatus | null | undefined,
@@ -624,63 +506,4 @@ function emptyStateHint(
   if (!sourceUid) return "未检测到 VS Code CodeBuddy 插件当前登录账号，请先在 VS Code 中登录";
   if (!hasCopyable) return "当前账号暂无可复制的会话（无含正文的历史）";
   return "将当前账号勾选的会话以新 id 复制给目标账号（加法，不影响源账号）";
-}
-
-/** 组头三态复选框：全选 / 半选（点击即全选）/ 未选。 */
-function TreeCheckbox({
-  allOn,
-  someOn,
-  onChange,
-  ariaLabel,
-}: {
-  allOn: boolean;
-  someOn: boolean;
-  onChange: () => void;
-  ariaLabel: string;
-}) {
-  return (
-    <Checkbox
-      checked={allOn ? true : someOn ? "indeterminate" : false}
-      onCheckedChange={onChange}
-      aria-label={ariaLabel}
-    />
-  );
-}
-
-function SessionRow({
-  session,
-  checked,
-  onToggle,
-}: {
-  session: VscodeSession;
-  checked: boolean;
-  onToggle: () => void;
-}) {
-  return (
-    <label className="flex cursor-pointer items-center gap-2.5 rounded-md py-1.5 pl-7 pr-2 hover:bg-accent/50">
-      <Checkbox
-        checked={checked}
-        onCheckedChange={onToggle}
-        aria-label={`选择会话 ${session.title}`}
-      />
-      <span className="min-w-0 flex-1 truncate text-sm" title={session.title}>
-        {session.title}
-      </span>
-      {session.updatedAt > 0 && (
-        <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
-          {formatUpdatedAt(session.updatedAt)}
-        </span>
-      )}
-      <Badge variant="outline" className="shrink-0 text-[10px]">
-        有正文
-      </Badge>
-    </label>
-  );
-}
-
-/** 会话时间：MM/DD HH:mm（本地时区）。 */
-function formatUpdatedAt(ts: number): string {
-  const date = new Date(ts);
-  if (Number.isNaN(date.getTime())) return "";
-  return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }

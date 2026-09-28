@@ -2,10 +2,10 @@ import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CodeBuddyCnIdeStatus, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
   GithubConfig, RateLimitHookStatus, RateLimitsPayload, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
-  TravelConfig, TravelStatus, VscodeExtStatus, VscodeSessionList,
+  SessionLinksPreview, TravelConfig, TravelStatus, VscodeExtStatus, VscodeSessionList,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
-import { accountVariant, normalizeVariant } from "./variant";
+import { accountVariant, normalizeVariant, variantSupportsCheckin } from "./variant";
 
 export const screenshotDemoEnabled = demoModeEnabled;
 
@@ -22,18 +22,33 @@ interface AccountUsageSeed {
   models: ModelSeed[];
 }
 
-// 演示数据只覆盖国内版；切换国际版时展示的是空状态（不构造国际版演示账号）。
+// 演示数据按档位分组：前三行是国内版 fixture，后两行是国际版。
+// 国际版只覆盖账号页（及数据同源的积分统计视图）；Token 统计的 workbuddy-ai 源、
+// 限额台账、签到、旅行、轮换保持原有空态，见 `emptyTokenSource` 与各档位能力函数。
+const intlAccountA: AccountMeta = { id: "demo-account-ai-a", uid: "demo-intl-001", email: "intl-a@example.com", nickname: "国际版 A", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "ai" };
+const intlAccountB: AccountMeta = { id: "demo-account-ai-b", uid: "demo-intl-002", email: "intl-b@example.com", nickname: "国际版 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "ai" };
+
 const accounts: AccountMeta[] = [
   { id: "demo-account-a", uid: "demo-user-001", email: "test-a@example.com", nickname: "测试 A", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
   { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
   { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
+  intlAccountA,
+  intlAccountB,
 ];
 
 /** 演示模式中的临时 CLI 当前账号，仅存在于本次页面会话。 */
 let demoActiveCliAccountId = accounts[0].id;
 
+/**
+ * 积分统计里的「当前账号」：后端按账号列表构造 `current_account_ids`（列表内即当前），
+ * 前端档位视图只把 `isCurrent` 账号计入「当前剩余」。演示里各档位取一个代表账号，
+ * 使国际版视图也有非零的当前剩余；国内版仍只取账号 A，保持既有数值不变。
+ */
+const currentAccountIds = new Set([accounts[0].id, intlAccountA.id]);
+
 // Counts and relative model roles follow anonymous aggregates from the sanitized local cache.
 // No upstream request row or identifier is copied into this fixture.
+// 与 `accounts` 严格同索引：`buildStatistics()` 按账号索引取这里的 seed。
 const usageSeeds: AccountUsageSeed[] = [
   {
     requestCount: 2243,
@@ -57,6 +72,23 @@ const usageSeeds: AccountUsageSeed[] = [
     models: [
       { model: "deepseek-v4-flash", requestCount: 309, credit: 595.08 },
       { model: "hy3", requestCount: 9, credit: 0 },
+    ],
+  },
+  // 国际版 A：用量集中在主力模型，国际版演示视图因此有可读的曲线与模型占比。
+  {
+    requestCount: 1420,
+    models: [
+      { model: "deepseek-v4-flash", requestCount: 1338, credit: 1120.5 },
+      { model: "kimi-k3-1", requestCount: 68, credit: 642.7 },
+      { model: "glm-5.2", requestCount: 14, credit: 33.63 },
+    ],
+  },
+  // 国际版 B：轻量账号，用于演示同一档位内的用量差异。
+  {
+    requestCount: 268,
+    models: [
+      { model: "deepseek-v4-flash", requestCount: 240, credit: 482.9 },
+      { model: "hy3", requestCount: 28, credit: 0 },
     ],
   },
 ];
@@ -84,6 +116,17 @@ const creditPackages = [
     ["CodeBuddy 新用户体验包", 360, 214.5, 14],
     ["CodeBuddy 签到赠送积分", 180, 96.75, 21],
     ["CodeBuddy 活动奖励积分", 300, 207.9, 38],
+  ],
+  // 国际版账号：合成码不会命中官方商品码映射，因此展示的就是这里自造的名字；
+  // 沿用官方命名口径，覆盖「试用 / 赠送 / 购买」三类国际版语义。
+  [
+    ["试用版基础用量", 2000, 1340.8, 30],
+    ["版本赠送用量", 600, 402.35, 75],
+  ],
+  [
+    ["购买积分", 3000, 2180.6, 12],
+    ["试用版基础用量", 500, 318.75, 60],
+    ["平台奖励积分", 800, 512.4, 90],
   ],
 ] as const;
 
@@ -294,23 +337,38 @@ function buildStatistics(): CreditStatistics {
     coverageStartAt: atLocalTime(29, 0, 0),
     summary: { currentRemaining: Number(totalRemaining.toFixed(2)), currentCapacity: totalCapacity, usageToday, usage7Days, usageThisMonth, todayCheckedInAccounts: 3, todaySuccess: 2, todayAlready: 1, todayFailed: 0 },
     daily,
-    accounts: demoAccounts.map((account, index) => ({
-      accountId: account.id,
-      accountName: account.nickname ?? account.email ?? account.id,
-      isCurrent: index === 0,
-      currentRemaining: creditRows[index].totalRemaining ?? null,
-      totalCapacity: creditRows[index].totalCapacity ?? null,
-      lastSnapshotAt: generatedAt - index * 120_000,
-      usageToday: officialAccounts[index].usageToday ?? 0,
-      usage7Days: officialAccounts[index].usage7Days ?? 0,
-      usageThisMonth: officialAccounts[index].usageThisMonth ?? 0,
-      checkedInToday: true,
-      checkinStatusToday: index === 1 ? "already" : "success",
-      lastCheckinAt: atLocalTime(0, 8, 6 + index * 9),
-      lastCheckinResult: index === 1 ? "already" : "success",
-      daily: accountDaily[index],
-    })),
-    events: demoAccounts.map((account, index) => ({ kind: "checkin" as const, ts: atLocalTime(0, 8, 6 + index * 9), date: localDate(0), accountId: account.id, accountName: account.nickname ?? account.email ?? account.id, result: index === 1 ? "already" : "success" })),
+    accounts: demoAccounts.map((account, index) => {
+      // 国际版没有签到接口：签到态一律留空，与 `variantSupportsCheckin` 一致。
+      const checkinSupported = variantSupportsCheckin(accountVariant(account));
+      const checkinResult = index === 1 ? "already" : "success";
+      return {
+        accountId: account.id,
+        accountName: account.nickname ?? account.email ?? account.id,
+        isCurrent: currentAccountIds.has(account.id),
+        currentRemaining: creditRows[index].totalRemaining ?? null,
+        totalCapacity: creditRows[index].totalCapacity ?? null,
+        lastSnapshotAt: generatedAt - index * 120_000,
+        usageToday: officialAccounts[index].usageToday ?? 0,
+        usage7Days: officialAccounts[index].usage7Days ?? 0,
+        usageThisMonth: officialAccounts[index].usageThisMonth ?? 0,
+        checkedInToday: checkinSupported ? true : null,
+        checkinStatusToday: checkinSupported ? checkinResult : null,
+        lastCheckinAt: checkinSupported ? atLocalTime(0, 8, 6 + index * 9) : null,
+        lastCheckinResult: checkinSupported ? checkinResult : null,
+        daily: accountDaily[index],
+      };
+    }),
+    // 签到事件按档位能力生成：国际版没有签到接口，不构造事件（国内版索引与取值不变）。
+    events: demoAccounts.flatMap((account, index) => variantSupportsCheckin(accountVariant(account))
+      ? [{
+          kind: "checkin" as const,
+          ts: atLocalTime(0, 8, 6 + index * 9),
+          date: localDate(0),
+          accountId: account.id,
+          accountName: account.nickname ?? account.email ?? account.id,
+          result: index === 1 ? "already" : "success",
+        }]
+      : []),
     officialUsage: {
       status: "complete",
       rangeStart: localDate(29),
@@ -402,8 +460,11 @@ function rateLimitHookStatus(): RateLimitHookStatus {
   };
 }
 
+/** 签到日志同样只覆盖支持签到的档位；国内版三账号的索引与条目取值保持不变。 */
 function checkinLogs(): CheckinLog[] {
-  return hydratedAccounts().flatMap((account, accountIndex) => [0, 1, 2].map((daysAgo) => ({ ts: atLocalTime(daysAgo, 8, 6 + accountIndex * 9), accountId: account.id, email: account.nickname ?? account.email ?? account.id, result: accountIndex === 1 && daysAgo === 0 ? "already" : "success" })));
+  return hydratedAccounts().flatMap((account, accountIndex) => variantSupportsCheckin(accountVariant(account))
+    ? [0, 1, 2].map((daysAgo) => ({ ts: atLocalTime(daysAgo, 8, 6 + accountIndex * 9), accountId: account.id, email: account.nickname ?? account.email ?? account.id, result: accountIndex === 1 && daysAgo === 0 ? "already" : "success" }))
+    : []);
 }
 
 function rotateLogs(): RotateLog[] {
@@ -524,6 +585,20 @@ function demoTokenStatistics(days?: number): TokenStatistics {
   return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), emptyTokenSource("workbuddy-ai"), demoTokenSource("codebuddy-cli", 0.58), demoTokenSource("codebuddy-ide", 0.36)] };
 }
 
+/** 演示用的 IDE 会话列表：国内版 / 国际版共用同一套存储，只有来源 uid 不同。 */
+function demoIdeSessionList(sourceUid: string): VscodeSessionList {
+  return {
+    sourceUid,
+    skipped: 0,
+    dataRoot: "/demo/CodeBuddyExtension/Data",
+    sessions: [
+      { id: "4a598bb4e3144a799e602dd6c9091d03", workspaceHash: "6c4b8aec50b679a6fc4023b379160418", title: "两分钟后自动回复设置", updatedAt: Date.now() - 1000 * 60 * 8, type: "craft", hasHistory: true },
+      { id: "1d2e3f405162738495a6b7c8d9e0f1a2", workspaceHash: "6c4b8aec50b679a6fc4023b379160418", title: "整理会话复制文案", updatedAt: Date.now() - 1000 * 60 * 90, type: "craft", hasHistory: true },
+      { id: "a1b2c3d4e5f60718293a4b5c6d7e8f90", workspaceHash: "ffeeddccbbaa99887766554433221100", title: "工作区索引结构确认", updatedAt: Date.now() - 1000 * 60 * 60 * 30, type: "craft", hasHistory: true },
+    ],
+  };
+}
+
 /** Read-only demo response provider. It never reads or mutates real user data. */
 export function screenshotDemoResponse(command: string, args?: Record<string, unknown>): unknown {
   const demoAccounts = hydratedAccounts();
@@ -535,19 +610,20 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
   const rotateStatus: RotateStatus = { config, cliConfigured: true, activeAccountId: demoAccounts[0].id, activeAccountName: demoAccounts[0].nickname, lastCheckAt: atLocalTime(0, 9, 30), lastSwitchAt: atLocalTime(1, 16, 20) };
   const githubConfig: GithubConfig = { owner: "zhangjia", repo: "wb-switch", proxy: "" };
   switch (command) {
-    // 档位随请求回显：演示数据本身只有国内版账号，国际版展示空状态。
+    // 档位随请求回显：两个档位各有一套演示账号，国际版同样回显「运行中 + 当前账号」。
     case "get_status": {
       const variant = normalizeVariant(args?.variant);
-      return variant === "ai"
-        ? {
-            ...appStatus,
-            running: false,
-            current: null,
-            authFile: "/demo/workbuddy-ai/auth.json",
-            appPath: "/demo/WorkBuddy AI.app",
-            variant,
-          }
-        : { ...appStatus, variant };
+      if (variant === "ai") {
+        return {
+          ...appStatus,
+          running: true,
+          current: { uid: intlAccountA.uid, nickname: intlAccountA.nickname, email: intlAccountA.email },
+          authFile: "/demo/workbuddy-ai/auth.json",
+          appPath: "/demo/WorkBuddy AI.app",
+          variant,
+        };
+      }
+      return { ...appStatus, variant };
     }
     case "get_accounts": return { accounts: demoAccounts };
     case "get_codebuddy_cli_status": return cliStatus;
@@ -556,6 +632,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_codebuddy_cn_ide_status": return {
       installed: true,
       running: true,
+      loggedIn: true,
       dataDir: "/demo/codebuddy-cn-ide",
       dbPath: "/demo/codebuddy-cn-ide/state.vscdb",
       dbExists: true,
@@ -568,12 +645,13 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_codebuddy_ide_status": return {
       installed: true,
       running: true,
+      loggedIn: true,
       dataDir: "/demo/codebuddy-ide",
       dbPath: "/demo/codebuddy-ide/state.vscdb",
       dbExists: true,
       appPath: "/demo/CodeBuddy IDE.app",
-      activeAccountId: demoAccounts[1].id,
-      activeAccountName: demoAccounts[1].nickname,
+      activeAccountId: intlAccountA.id,
+      activeAccountName: intlAccountA.nickname,
     } satisfies CodeBuddyCnIdeStatus;
     case "get_vscode_ext_status": return {
       installed: true,
@@ -599,6 +677,22 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
         { id: "66554433221100998877665544332211", workspaceHash: "aabbccddeeff00112233445566778899", title: "(无标题)", updatedAt: Date.now() - 1000 * 60 * 60 * 50, type: "craft", hasHistory: false },
       ],
     } satisfies VscodeSessionList;
+    // 国内版 / 国际版 IDE 共用同一套会话存储，演示数据也只有来源 uid 不同。
+    case "list_codebuddy_ide_sessions": return demoIdeSessionList(demoAccounts[0].uid ?? "demo-source");
+    case "list_codebuddy_intl_ide_sessions": return demoIdeSessionList(intlAccountA.uid ?? "demo-intl-source");
+    // 关联预览：演示库没有复制记录，返回 missing（弹窗默认 tab 会拉一次；不得落到「演示模式不可操作」）。
+    case "codebuddy_ide_session_links_preview":
+    case "codebuddy_intl_ide_session_links_preview":
+    case "vscode_session_links_preview": {
+      const target = demoAccounts.find((account) => account.id === args?.targetAccountId) ?? demoAccounts[1] ?? demoAccounts[0];
+      return {
+        supported: true,
+        storeStatus: "missing",
+        sourceUid: demoAccounts[0].uid ?? "demo-source",
+        targetUid: target.uid ?? "demo-target",
+        groups: [],
+      } satisfies SessionLinksPreview;
+    }
     case "switch_codebuddy_cli_account": {
       const target = demoAccounts.find((account) => account.id === args?.accountId);
       if (!target) throw new Error("账号不存在");

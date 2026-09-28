@@ -266,6 +266,12 @@ export interface AppNotification {
   at: number;
 }
 
+/**
+ * 错误日志来源（`~/.wb-switch/error.log` 的 `kind` 字段）：
+ * 渲染崩溃 / 未捕获异常或 Promise 拒绝 / 后端错误。
+ */
+export type ErrorLogKind = "frontend_crash" | "frontend_unhandled" | "backend";
+
 export interface SwitchResult {
   ok: boolean;
   account: string;
@@ -818,10 +824,40 @@ export interface UpdateInfo {
   message?: string;
 }
 
+/** 统一更新服务的阶段（Rust 状态机，经 `update-state` 事件推送）。 */
+export type UpdatePhase =
+  | "idle"
+  | "checking"
+  | "upToDate"
+  | "available"
+  | "downloading"
+  | "readyToRestart"
+  | "error";
+
+/**
+ * 更新状态快照：托盘菜单与前端弹窗显示同一阶段（单一真相源在 Rust）。
+ *
+ * `latest` 无 `v` 前缀；`percent` 在下载总量未知时为 null；`message` 是错误 / 提示文案。
+ */
+export interface UpdateSnapshot {
+  phase: UpdatePhase;
+  latest: string | null;
+  percent: number | null;
+  message: string | null;
+  checkedAt: number | null;
+}
+
 /** CodeBuddy CN IDE（桌面客户端）状态；与 CodeBuddy CLI 独立。 */
 export interface CodeBuddyCnIdeStatus {
   installed: boolean;
   running: boolean;
+  /**
+   * 是否存在 IDE 登录态（`state.vscdb` 里有会话 secret 行）。
+   *
+   * 只读查询、不解密；查询失败或文件不存在时为 false。仅用于文案与入口判定，
+   * 不参与切换判定。国内版与国际版 IDE 状态都返回该字段（旧后端可能缺省 `undefined`）。
+   */
+  loggedIn?: boolean;
   dataDir: string | null;
   dbPath: string | null;
   dbExists: boolean;
@@ -839,6 +875,10 @@ export interface CodeBuddyCnIdeSwitchResult {
   dbPath?: string;
   restarted?: boolean;
   message?: string;
+  /** 切换时复制会话的结果（未勾选复制时不返回）。 */
+  sessionCopy?: VscodeSessionCopyResult;
+  /** 切换时同步关联会话的结果（未勾选同步时不返回）。 */
+  sessionSync?: VscodeSessionSyncReport;
 }
 
 /** VS Code 内 CodeBuddy 扩展（tencent-cloud.coding-copilot）状态；与 CN IDE / CLI 独立。 */
@@ -884,6 +924,48 @@ export interface VscodeExtSwitchResult {
   sessionCopy?: VscodeSessionCopyResult;
   /** 切换时同步关联会话的结果（未勾选同步时不返回）。 */
   sessionSync?: VscodeSessionSyncReport;
+}
+
+/** JetBrains IDE 的一条配置目录状态（IDEA / PyCharm 各自独立）。 */
+export interface JetbrainsTargetStatus {
+  /** 配置目录名（如 "PyCharm2026.2"）。 */
+  configDir: string;
+  /** 是否安装了 CodeBuddy 插件（plugins/coding-copilot* 目录存在）。 */
+  pluginInstalled: boolean;
+  running: boolean;
+  /** 是否存在插件登录态（secret-storage.xml 里有会话 secret）。 */
+  loggedIn: boolean;
+  secretPath: string;
+}
+
+export interface JetbrainsStatus {
+  /** 是否存在任一受支持的 JetBrains 配置目录。 */
+  installed: boolean;
+  /** 是否至少一个配置目录安装了 CodeBuddy 插件。 */
+  pluginInstalled: boolean;
+  /** 是否有「装了插件」的 IDE 正在运行。 */
+  running: boolean;
+  /** 是否任一装了插件的目标存在登录态。 */
+  loggedIn: boolean;
+  configRoot: string | null;
+  targets: JetbrainsTargetStatus[];
+  activeAccountId: string | null;
+  activeAccountName: string | null;
+  detectedFrom?: string;
+  statePath?: string;
+}
+
+export interface JetbrainsSwitchResult {
+  ok: boolean;
+  account: string;
+  accountId: string;
+  /** 本次写入的配置目录名列表（一次切换覆盖所有装了插件的 IDE）。 */
+  written?: string[];
+  /** 本次是否真的执行了「关闭并重新打开 IDE」。 */
+  restarted?: boolean;
+  /** 本次切换是否由 wb-switch 关闭了 IDE。 */
+  closedByUs?: boolean;
+  message?: string;
 }
 
 /** VS Code 扩展的一条可复制会话。 */

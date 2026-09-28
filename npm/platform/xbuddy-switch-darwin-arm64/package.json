@@ -1,6 +1,6 @@
 {
   "name": "xbuddy-switch-darwin-arm64",
-  "version": "0.1.47",
+  "version": "0.1.53",
   "description": "xbuddy-switch platform binary (darwin-arm64)",
   "os": [
     "darwin"

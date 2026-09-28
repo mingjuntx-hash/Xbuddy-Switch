@@ -37,7 +37,13 @@ fn official_usage_url_for(account: &Value) -> &'static str {
     }
 }
 pub const OFFICIAL_USAGE_PAGE_SIZE: usize = 3_000;
-pub const OFFICIAL_USAGE_DETAIL_LIMIT: usize = 100;
+/// 每个账号落进 `requests` 明细的条数上限。
+///
+/// 官方接口已全量扫回（见 [`OFFICIAL_USAGE_PAGE_SIZE`] 的分页扫描），这里只是
+/// 「明细对外暴露多少条」的闸门：定得太低，用户排查高消耗请求时看不到更早的
+/// 记录；不设上限，重度账号会把明细撑到几万条，缓存文件与前端渲染一起变慢。
+/// 1000 条配合前端分页与按消耗排序，足够覆盖排查场景，同时保持有界。
+pub const OFFICIAL_USAGE_DETAIL_LIMIT: usize = 1_000;
 /// 连续扫描的轮数上限：每轮最多 [`OFFICIAL_USAGE_PAGE_SIZE`] 条，100 轮足够覆盖
 /// 单账号单窗口的任何真实量级，同时兜住「服务端异常回同样一页」的死循环。
 const OFFICIAL_USAGE_MAX_ROUNDS: usize = 100;
@@ -290,7 +296,7 @@ fn error_message(response: &Value) -> String {
         .filter(|message| !message.is_empty())
         .map(|message| message.chars().take(160).collect::<String>());
     match response_code(response) {
-        Some(code) if code == -1 => "官方请求失败（网络或服务不可达）".to_string(),
+        Some(-1) => "官方请求失败（网络或服务不可达）".to_string(),
         Some(code) => upstream_message
             .map(|message| format!("官方请求失败（code={code}）：{message}"))
             .unwrap_or_else(|| format!("官方请求失败（code={code}）")),
@@ -649,10 +655,8 @@ pub async fn collect_official_usage(accounts: &[Value], at_ms: i64) -> Value {
     let mut daily_totals: HashMap<NaiveDate, f64> = HashMap::new();
     let mut daily_models: HashMap<NaiveDate, HashMap<String, (usize, f64)>> = HashMap::new();
     let mut account_daily_totals: HashMap<String, HashMap<NaiveDate, f64>> = HashMap::new();
-    let mut account_daily_models: HashMap<
-        String,
-        HashMap<NaiveDate, HashMap<String, (usize, f64)>>,
-    > = HashMap::new();
+    type AccountDailyModels = HashMap<String, HashMap<NaiveDate, HashMap<String, (usize, f64)>>>;
+    let mut account_daily_models: AccountDailyModels = HashMap::new();
     let mut total_today = 0.0;
     let mut total_week = 0.0;
     let mut total_month = 0.0;

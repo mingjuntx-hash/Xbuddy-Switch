@@ -1,6 +1,6 @@
 {
   "name": "xbuddy-switch-linux-x64",
-  "version": "0.1.47",
+  "version": "0.1.53",
   "description": "xbuddy-switch platform binary (linux-x64)",
   "os": [
     "linux"

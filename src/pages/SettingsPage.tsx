@@ -31,7 +31,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { TimePicker } from "@/components/ui/time-picker";
 import * as api from "@/lib/api";
+import { canPersistErrorLog } from "@/lib/error-report";
 import { getThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
+import { SUPPORTED_TOOLS, setToolEnabled, useSupportedTools, type ToolId } from "@/lib/supported-tools";
 import type {
   AccountMeta,
   AppNotification,
@@ -47,10 +49,13 @@ import type {
   UpdateInfo,
 } from "@/lib/types";
 import { GITHUB_RELEASE_URL, GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib/update";
+import { useUpdateState } from "@/lib/use-update-state";
+import { changeCompanionEnabled, reloadCompanionEnabled, useCompanionEnabled } from "@/lib/use-companion-enabled";
 import { cn } from "@/lib/utils";
-import { accountVariant, variantSupportsCheckin, variantSupportsTravel } from "@/lib/variant";
+import { accountVariant, variantSupportsCheckin, variantSupportsTravel, variantUsesIntlCodebuddyIde } from "@/lib/variant";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { DemoAction } from "@/components/demo-action";
+import { CodeBuddyAiIdeMark, CodeBuddyCnIdeMark, CodeBuddyMark, JetbrainsMark, VscodeExtMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import { useAccountsStore } from "@/stores/accounts";
 
 interface SettingsGroupProps {
@@ -1284,9 +1289,12 @@ function useAuthFile(): string | undefined {
 /** 自动更新：检查公开 GitHub Releases 源 + 安装签名更新。 */
 function UpdateCard() {
   const version = useAccountsStore((s) => s.status?.version);
+  // 阶段与进度来自 Rust 更新服务（托盘同源）：下载完成时按钮换成「重启以完成升级」。
+  const snapshot = useUpdateState();
   const [info, setInfo] = useState<UpdateInfo | null>(null);
   const [checking, setChecking] = useState(false);
   const [installOpen, setInstallOpen] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const [githubConfig, setGithubConfig] = useState<GithubConfig>({});
   const [proxyUrl, setProxyUrl] = useState("");
   const [proxySaving, setProxySaving] = useState(false);
@@ -1320,6 +1328,17 @@ function UpdateCard() {
       toast.error("检查更新失败", { description: api.asError(e) });
     } finally {
       setChecking(false);
+    }
+  }
+
+  /** 安装已下载的更新包并重启（下载完成后的主动作，与托盘菜单同一入口）。 */
+  async function restartNow() {
+    setRestarting(true);
+    try {
+      await api.updateRestart();
+    } catch (e) {
+      setRestarting(false);
+      toast.error("重启失败", { description: api.asError(e) });
     }
   }
 
@@ -1419,10 +1438,19 @@ function UpdateCard() {
                 {info.releaseName && <span className="text-muted-foreground"> · {info.releaseName}</span>}
               </div>
               {info.hasUpdate && (
-                <DemoAction><Button size="sm" onClick={() => setInstallOpen(true)}>
-                  <ArrowUpCircle />
-                  立即升级
-                </Button></DemoAction>
+                <DemoAction>
+                  {snapshot.phase === "readyToRestart" ? (
+                    <Button size="sm" onClick={() => void restartNow()} disabled={restarting}>
+                      {restarting ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                      {restarting ? "正在重启…" : "重启以完成升级"}
+                    </Button>
+                  ) : (
+                    <Button size="sm" onClick={() => setInstallOpen(true)}>
+                      <ArrowUpCircle />
+                      立即升级
+                    </Button>
+                  )}
+                </DemoAction>
               )}
               {info.releaseUrl && (
                 <DemoAction><Button
@@ -1437,11 +1465,7 @@ function UpdateCard() {
             </AlertDescription>
           </Alert>
         )}
-        <UpdateInstallDialog
-          open={installOpen}
-          onOpenChange={setInstallOpen}
-          update={info}
-        />
+        <UpdateInstallDialog open={installOpen} onOpenChange={setInstallOpen} />
       </CardContent>
     </SettingsGroup>
   );
@@ -1505,6 +1529,57 @@ function StartupCard() {
             onCheckedChange={(v) => void onToggle(v)}
             aria-label="开机时静默启动到托盘"
           />
+        </SettingsFieldRow>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/** 桌面版 Agent Companion：状态以宿主后端的持久化结果为准。 */
+function CompanionCard() {
+  const { enabled, busy, error } = useCompanionEnabled();
+
+  async function onToggle(next: boolean) {
+    try {
+      const confirmed = await changeCompanionEnabled(next);
+      toast.success(confirmed ? "已启用 Agent Companion 悬浮窗" : "已关闭 Agent Companion 悬浮窗");
+    } catch (cause) {
+      toast.error("悬浮窗设置失败", { description: api.asError(cause) });
+    }
+  }
+
+  async function openSettings() {
+    try {
+      await api.openCompanionSettings();
+    } catch (error) {
+      toast.error("打开悬浮窗设置失败", { description: api.asError(error) });
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-companion" title="Agent Companion">
+      <CardContent className="space-y-0 p-0">
+        <SettingsFieldRow
+          className="border-b-0"
+          label="启用会话悬浮窗"
+          description="启用后显示悬浮栏；开机静默启动时也会显示，可从托盘临时隐藏"
+          htmlFor="companion-enabled"
+        >
+          <div className="flex items-center gap-2">
+            {error && enabled === null ? (
+              <Button size="sm" variant="outline" onClick={() => void reloadCompanionEnabled()}>重试</Button>
+            ) : null}
+            {enabled ? (
+              <Button size="sm" variant="outline" onClick={() => void openSettings()}>悬浮窗设置</Button>
+            ) : null}
+            <Switch
+              id="companion-enabled"
+              checked={enabled ?? false}
+              disabled={busy || enabled === null}
+              onCheckedChange={(value) => void onToggle(value)}
+              aria-label="启用会话悬浮窗"
+            />
+          </div>
         </SettingsFieldRow>
       </CardContent>
     </SettingsGroup>
@@ -1644,6 +1719,87 @@ function NotificationHistoryCard() {
   );
 }
 
+/** 错误日志：前端崩溃与未捕获错误的落盘位置（排障用；与通知历史同为事后核对入口）。 */
+function ErrorLogCard() {
+  const [path, setPath] = useState<string | null>(null);
+  const [pathError, setPathError] = useState(false);
+  const [revealing, setRevealing] = useState(false);
+  // 浏览器演示页没有 Tauri，`isWebui()` 也为真；截图仍要看到路径和按钮。
+  const showReveal = canPersistErrorLog() || api.isDemoMode();
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getErrorLogPath()
+      .then((value) => {
+        if (!cancelled) setPath(value);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setPath("");
+          setPathError(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function revealLog() {
+    setRevealing(true);
+    try {
+      await api.revealErrorLog();
+    } catch (e) {
+      toast.error("打开日志位置失败", { description: api.asError(e) });
+    } finally {
+      setRevealing(false);
+    }
+  }
+
+  const pathText =
+    path === null
+      ? "正在读取…"
+      : path
+        ? path
+        : pathError
+          ? "未能读取错误日志路径"
+          : "浏览器模式下不会写入本机错误日志";
+
+  return (
+    <SettingsGroup id="settings-error-log" title="错误日志">
+      <CardContent className="space-y-0 p-0">
+        <div className="border-b border-border/50 px-4 py-3 text-xs leading-5 text-muted-foreground sm:px-5">
+          {showReveal
+            ? "界面崩溃与未捕获的错误会记录在这里（最多保留最近 200 条），反馈问题时可直接附上。"
+            : "浏览器模式下，界面错误只会在页面上提示，不会写入本机错误日志。"}
+        </div>
+        <div
+          className={cn(
+            "break-all bg-foreground/[0.04] px-4 py-3 font-mono text-[11px] leading-5 text-muted-foreground sm:px-5",
+            showReveal && "border-b border-border/50",
+          )}
+        >
+          {pathText}
+        </div>
+        {showReveal && (
+          <div className="flex flex-wrap gap-2 px-4 py-3 sm:px-5">
+            <DemoAction>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={revealing || !path}
+                onClick={() => void revealLog()}
+              >
+                {revealing ? <Loader2 className="animate-spin" /> : null}打开日志位置
+              </Button>
+            </DemoAction>
+          </div>
+        )}
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
 function AppearanceCard() {
   const [theme, setTheme] = useState<ThemePreference>(getThemePreference);
 
@@ -1676,6 +1832,55 @@ function AppearanceCard() {
             </SelectContent>
           </Select>
         </SettingsFieldRow>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 支持工具：控制各客户端入口是否在界面上出现。
+ *
+ * 关闭只隐藏入口（账号卡片按钮、页顶状态徽标）并跳过该端的状态轮询，
+ * 不动账号库、不影响其它工具，重新打开即恢复。JetBrains 端默认关闭
+ * （新增端先灰度），打开后才出现对应入口。
+ */
+function SupportedToolsCard() {
+  const enabled = useSupportedTools();
+  const variant = useAccountsStore((s) => s.variant);
+  /** 行内产品图标：与账号页页顶徽标同一套档位规则（国际版用国际版字块）。 */
+  const marks: Record<ToolId, (size: number) => ReactNode> = {
+    workbuddy: (size) => (variant === "ai" ? <WorkBuddyAiMark size={size} /> : <WorkBuddyMark size={size} />),
+    codebuddyIde: (size) =>
+      variantUsesIntlCodebuddyIde(variant) ? <CodeBuddyAiIdeMark size={size} /> : <CodeBuddyCnIdeMark size={size} />,
+    codebuddyCli: (size) => <CodeBuddyMark size={size} />,
+    vscodeExt: (size) => <VscodeExtMark size={size} />,
+    jetbrains: (size) => <JetbrainsMark size={size} />,
+  };
+
+  return (
+    <SettingsGroup id="settings-tools" title="支持工具">
+      <CardContent className="space-y-0 p-0">
+        {SUPPORTED_TOOLS.map((tool, index) => (
+          <SettingsFieldRow
+            key={tool.id}
+            className={index === SUPPORTED_TOOLS.length - 1 ? "border-b-0" : undefined}
+            label={
+              <span className="flex items-center gap-2.5">
+                {marks[tool.id](20)}
+                <span>{tool.label}</span>
+              </span>
+            }
+            description={tool.description}
+            htmlFor={`tools-${tool.id}`}
+          >
+            <Switch
+              id={`tools-${tool.id}`}
+              checked={enabled[tool.id]}
+              onCheckedChange={(on) => setToolEnabled(tool.id, on)}
+              aria-label={tool.label}
+            />
+          </SettingsFieldRow>
+        ))}
       </CardContent>
     </SettingsGroup>
   );
@@ -1872,23 +2077,28 @@ function RateLimitCard() {
   );
 }
 
-/** 设置页：外观 / 权限检测 / 自动签到（含自动旅行）/ 自动轮换 / 限额监听 / 更新配置。 */
+/** 设置页：演示模式不渲染自动签到；Agent Companion 只在桌面正式版显示。 */
 export default function SettingsPage() {
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
       <header className="mb-10 sm:mb-12">
         <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
-        <p className="mt-2 text-sm leading-6 text-muted-foreground">自动签到、限额监听、权限检测与自动更新配置。</p>
+        <p className="mt-2 text-sm leading-6 text-muted-foreground">
+          {api.isDemoMode() ? "限额监听、权限检测与自动更新配置。" : "自动签到、限额监听、权限检测与自动更新配置。"}
+        </p>
       </header>
 
       <div className="min-w-0 space-y-12">
         <AppearanceCard />
+        <SupportedToolsCard />
         <PermissionCheckCard />
-        <AutoCheckinCard />
+        {api.isDemoMode() ? null : <AutoCheckinCard />}
         <AutoRotateCard />
         <RateLimitCard />
+        {api.isDesktop() && !api.isDemoMode() ? <CompanionCard /> : null}
         {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
         <NotificationHistoryCard />
+        <ErrorLogCard />
         {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard />}
       </div>
     </div>

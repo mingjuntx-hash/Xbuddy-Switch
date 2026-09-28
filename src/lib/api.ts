@@ -18,6 +18,7 @@ import type {
   CreditExpiry,
   CreditStatistics,
   TokenStatistics,
+  ErrorLogKind,
   GithubConfig,
   ImportPreviewAccount,
   ImportResult,
@@ -42,8 +43,11 @@ import type {
   TravelConfig,
   TravelStatus,
   UpdateInfo,
+  UpdateSnapshot,
   VscodeExtStatus,
   VscodeExtSwitchResult,
+  JetbrainsStatus,
+  JetbrainsSwitchResult,
   VscodeSessionList,
   VscodeSessionRef,
   WbVariant,
@@ -59,7 +63,7 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 const API_BASE = "http://127.0.0.1:57890";
 
 const DEMO_READ_COMMANDS = new Set([
-  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_vscode_ext_status", "list_vscode_sessions", "get_checkin_status",
+  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_vscode_ext_status", "get_jetbrains_status", "list_vscode_sessions", "list_codebuddy_ide_sessions", "list_codebuddy_intl_ide_sessions", "vscode_session_links_preview", "codebuddy_ide_session_links_preview", "codebuddy_intl_ide_session_links_preview", "get_checkin_status",
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
   "get_token_statistics",
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
@@ -91,6 +95,12 @@ export function isDesktop(): boolean {
   return !isWebui() && !isMobilePlatform();
 }
 
+/** Agent Companion 只由桌面宿主管理，不能经 WebUI 或演示模式访问。 */
+function requireCompanionDesktop(): void {
+  if (demoModeEnabled) throw new Error(DEMO_UNAVAILABLE_MESSAGE);
+  if (!isDesktop()) throw new Error("Agent Companion 仅在桌面版中可用");
+}
+
 type Route = { method: "GET" | "POST"; path: string };
 
 /** Tauri command → HTTP 路由映射（webui 模式）。 */
@@ -103,7 +113,15 @@ const ROUTES: Record<string, Route> = {
   get_codebuddy_cn_ide_status: { method: "GET", path: "/api/codebuddy-cn-ide/status" },
   switch_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/switch" },
   detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
+  list_codebuddy_ide_sessions: { method: "GET", path: "/api/codebuddy-cn-ide/sessions" },
+  codebuddy_ide_session_links_preview: {
+    method: "POST",
+    path: "/api/codebuddy-cn-ide/session-links",
+  },
   get_vscode_ext_status: { method: "GET", path: "/api/vscode-ext/status" },
+  get_jetbrains_status: { method: "GET", path: "/api/jetbrains/status" },
+  switch_jetbrains_account: { method: "POST", path: "/api/jetbrains/switch" },
+  detect_jetbrains_account: { method: "POST", path: "/api/jetbrains/detect" },
   list_vscode_sessions: { method: "GET", path: "/api/vscode-ext/sessions" },
   switch_vscode_ext_account: { method: "POST", path: "/api/vscode-ext/switch" },
   vscode_session_links_preview: { method: "POST", path: "/api/vscode-ext/session-links" },
@@ -111,6 +129,11 @@ const ROUTES: Record<string, Route> = {
   get_codebuddy_ide_status: { method: "GET", path: "/api/codebuddy-ide/status" },
   switch_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/switch" },
   detect_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/detect" },
+  list_codebuddy_intl_ide_sessions: { method: "GET", path: "/api/codebuddy-ide/sessions" },
+  codebuddy_intl_ide_session_links_preview: {
+    method: "POST",
+    path: "/api/codebuddy-ide/session-links",
+  },
   delete_account: { method: "POST", path: "/api/delete" },
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
@@ -277,11 +300,36 @@ export function getCodebuddyCnIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
   return call("get_codebuddy_cn_ide_status");
 }
 
+/**
+ * 切换 CodeBuddy IDE 账号（可同时复制 / 同步会话）。
+ *
+ * `restart` 默认 true：IDE 运行时由后端先关闭、写入后再重新打开。
+ * `copySessions` 非空时切换前把勾选会话复制到目标账号（默认沿用会话 id，冲突才重随机）；
+ * `syncSelections` 与 VS Code 侧同形；两者都不传时行为与纯切换逐字一致。
+ */
 export function switchCodebuddyCnIdeAccount(
   accountId: string,
   restart = true,
+  copySessions?: VscodeSessionRef[],
+  syncSelections?: SessionSyncSelection[],
 ): Promise<CodeBuddyCnIdeSwitchResult> {
-  return call("switch_codebuddy_cn_ide_account", { accountId, restart });
+  return call("switch_codebuddy_cn_ide_account", { accountId, restart, copySessions, syncSelections });
+}
+
+/** 列出当前 CodeBuddy IDE 账号可复制的会话（未登录/未安装时返回空列表）。 */
+export function listCodebuddyIdeSessions(): Promise<VscodeSessionList> {
+  return call("list_codebuddy_ide_sessions");
+}
+
+/**
+ * 预览「当前 CodeBuddy IDE 账号 → 目标账号」可同步的关联会话。
+ *
+ * 只读：`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源，前端不得自行扩大。
+ */
+export function codebuddyIdeSessionLinksPreview(
+  targetAccountId: string,
+): Promise<SessionLinksPreview> {
+  return call("codebuddy_ide_session_links_preview", { targetAccountId });
 }
 
 export function detectCodebuddyCnIdeAccount(): Promise<{
@@ -338,15 +386,70 @@ export function detectVscodeExtAccount(): Promise<{
   return call("detect_vscode_ext_account");
 }
 
+export function getJetbrainsStatus(): Promise<JetbrainsStatus> {
+  return call("get_jetbrains_status");
+}
+
+/**
+ * 切换 JetBrains IDE（IDEA / PyCharm）CodeBuddy 插件账号。
+ *
+ * `restart` 默认 true：IDE 运行时由后端先优雅退出、写入后再重新打开；
+ * 传 false 退回「请先完全退出 IDE」的手动模式（不在 IDE 中自动操作）。
+ * `configDirs` 可选：目标配置目录名列表（如 ["PyCharm2026.2"]），缺省 / 空
+ * = 全部装了插件的 IDE；非空时只写所选目录、只关闭/重开这些目录的运行实例。
+ */
+export function switchJetbrainsAccount(
+  accountId: string,
+  restart = true,
+  configDirs?: string[],
+): Promise<JetbrainsSwitchResult> {
+  return call("switch_jetbrains_account", { accountId, restart, configDirs });
+}
+
+export function detectJetbrainsAccount(): Promise<{
+  ok: boolean;
+  found: boolean;
+  matched?: boolean;
+  accountId?: string;
+  message?: string;
+}> {
+  return call("detect_jetbrains_account");
+}
+
 export function getCodebuddyIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
   return call("get_codebuddy_ide_status");
 }
 
+/**
+ * 切换 CodeBuddy IDE（国际版）账号（可同时复制 / 同步会话）。
+ *
+ * `restart` 默认 true：IDE 运行时由后端先关闭、写入后再重新打开。
+ * `copySessions` 非空时切换前把勾选会话复制到目标账号（默认沿用会话 id，冲突才重随机）；
+ * `syncSelections` 与国内版同形；两者都不传时行为与纯切换逐字一致。
+ */
 export function switchCodebuddyIdeAccount(
   accountId: string,
   restart = true,
+  copySessions?: VscodeSessionRef[],
+  syncSelections?: SessionSyncSelection[],
 ): Promise<CodeBuddyCnIdeSwitchResult> {
-  return call("switch_codebuddy_ide_account", { accountId, restart });
+  return call("switch_codebuddy_ide_account", { accountId, restart, copySessions, syncSelections });
+}
+
+/** 列出当前国际版 CodeBuddy IDE 账号可复制的会话（未登录/未安装时返回空列表）。 */
+export function listCodebuddyIntlIdeSessions(): Promise<VscodeSessionList> {
+  return call("list_codebuddy_intl_ide_sessions");
+}
+
+/**
+ * 预览「当前国际版 CodeBuddy IDE 账号 → 目标账号」可同步的关联会话。
+ *
+ * 只读：`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源，前端不得自行扩大。
+ */
+export function codebuddyIntlIdeSessionLinksPreview(
+  targetAccountId: string,
+): Promise<SessionLinksPreview> {
+  return call("codebuddy_intl_ide_session_links_preview", { targetAccountId });
 }
 
 export function detectCodebuddyIdeAccount(): Promise<{
@@ -479,6 +582,35 @@ export function revealAppInFinder(): Promise<void> {
   if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
   if (isWebui()) return Promise.resolve();
   return call("reveal_app_in_finder");
+}
+
+/** 后端持久化的悬浮栏启用状态；默认值由后端决定。 */
+export function getCompanionEnabled(): Promise<boolean> {
+  try {
+    requireCompanionDesktop();
+    return call("get_companion_enabled");
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+/** 返回后端确认的最终状态，不在前端单独持久化。 */
+export function setCompanionEnabled(enabled: boolean): Promise<boolean> {
+  try {
+    requireCompanionDesktop();
+    return call("set_companion_enabled", { enabled });
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+export function openCompanionSettings(): Promise<void> {
+  try {
+    requireCompanionDesktop();
+    return call("open_companion_settings");
+  } catch (error) {
+    return Promise.reject(error);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +922,57 @@ export function relaunchApp(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 统一更新服务（桌面端；`update-state` 事件是阶段与进度的唯一来源）
+// ---------------------------------------------------------------------------
+
+/** 浏览器 / 演示模式没有更新服务：与弹窗既有文案逐字一致。 */
+const UPDATE_UNSUPPORTED_MESSAGE = "浏览器 webui 模式不能直接安装桌面更新包";
+
+/**
+ * 更新状态快照（前端首屏初始化；之后由 `update-state` 事件推送）。
+ *
+ * webui 没有更新服务、演示模式禁止真实下载，两者都回落到静态快照：
+ * 演示模式给「有新版」态，保证演示页 / 截图里的升级入口与外链完整。
+ */
+export function updateState(): Promise<UpdateSnapshot> {
+  if (demoModeEnabled) {
+    // 复用只读演示数据的版本号，避免版本号在两处硬编码。
+    const demo = screenshotDemoResponse("check_update") as UpdateInfo;
+    return Promise.resolve({
+      phase: "available",
+      latest: demo.latest ?? null,
+      percent: null,
+      message: null,
+      checkedAt: null,
+    });
+  }
+  if (isWebui()) {
+    return Promise.resolve({
+      phase: "idle",
+      latest: null,
+      percent: null,
+      message: null,
+      checkedAt: null,
+    });
+  }
+  return call("update_state");
+}
+
+/** 启动更新包下载（异步，立即返回；进度走 `update-state` 事件与托盘）。 */
+export function updateDownload(): Promise<void> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) return Promise.reject(new Error(UPDATE_UNSUPPORTED_MESSAGE));
+  return call<unknown>("update_download").then(() => undefined);
+}
+
+/** 安装已下载的更新包并重启（用户点「重启以完成升级」时调用）。 */
+export function updateRestart(): Promise<void> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) return Promise.reject(new Error(UPDATE_UNSUPPORTED_MESSAGE));
+  return call<unknown>("update_restart").then(() => undefined);
+}
+
+// ---------------------------------------------------------------------------
 // 开机自启（仅桌面端；webui 不提供同名接口，卡片也不在 webui 渲染）
 // ---------------------------------------------------------------------------
 
@@ -838,4 +1021,35 @@ export function listNotifications(): Promise<{ items: AppNotification[] }> {
 export function clearNotifications(): Promise<{ cleared: boolean }> {
   if (demoModeEnabled) return Promise.resolve({ cleared: false });
   return call("clear_notifications");
+}
+
+// ---------------------------------------------------------------------------
+// 错误日志（前端崩溃 / 未捕获错误落盘，见 lib/error-report.ts）
+// ---------------------------------------------------------------------------
+
+/**
+ * 上报一条错误到本地错误日志（桌面端落盘 `~/.wb-switch/error.log`）。
+ *
+ * webui / 演示模式没有落盘通道：静默忽略（调用方的本地提示不受影响）。
+ */
+export function logError(kind: ErrorLogKind, message: string, detail?: string): Promise<void> {
+  if (demoModeEnabled || isWebui()) return Promise.resolve();
+  return call<unknown>("log_error", { kind, message, detail: detail ?? null }).then(
+    () => undefined,
+  );
+}
+
+/** 错误日志文件路径（设置页展示）。 */
+export function getErrorLogPath(): Promise<string> {
+  // 演示模式给一条与其它演示路径同风格的值，保证演示页 / 截图里界面完整。
+  if (demoModeEnabled) return Promise.resolve("/demo/.wb-switch/error.log");
+  // webui 没有落盘通道（不写服务端日志），设置页不展示路径。
+  if (isWebui()) return Promise.resolve("");
+  return call<string>("get_error_log_path");
+}
+
+/** 在文件管理器中定位错误日志（桌面端；日志尚未生成时由后端打开所在目录）。 */
+export function revealErrorLog(): Promise<void> {
+  if (demoModeEnabled || isWebui()) return Promise.resolve();
+  return call<unknown>("reveal_error_log").then(() => undefined);
 }

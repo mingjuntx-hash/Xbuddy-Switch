@@ -50,7 +50,7 @@ use crate::modules::variant::WbVariant;
 
 /// 关联存储的命名空间：决定关联表 / 基线 / 预览凭据 / 存储锁的名字。
 ///
-/// 两个宿主（WorkBuddy 桌面版与 VS Code CodeBuddy 插件）共用同一份内核
+/// 三个宿主（WorkBuddy 桌面版、VS Code CodeBuddy 插件、CodeBuddy IDE）共用同一份内核
 /// （[`crate::modules::session_link`]），但各自的关联关系互不可见：
 /// 同一工具存储根下按命名空间取不同的文件名与目录名，避免互相污染。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,6 +60,8 @@ pub enum LinkNamespace {
     WorkBuddy,
     /// VS Code CodeBuddy 插件的会话（独立文件名与目录）。
     VscodeExt,
+    /// CodeBuddy IDE（国内版桌面客户端）的会话（独立文件名与目录）。
+    CodeBuddyIde,
 }
 
 /// 会话操作涉及的路径集合：工具存储根（`~/.wb-switch`）与档位数据根。
@@ -109,6 +111,23 @@ impl SessionPaths {
         }
     }
 
+    /// CodeBuddy IDE（国内版桌面客户端）的关联存储路径。
+    ///
+    /// 与 [`Self::for_vscode_ext`] 同构：只用到 `store_root`，会话文件由调用方按数据根另行解析。
+    pub fn for_codebuddy_ide() -> Self {
+        Self::for_codebuddy_ide_at(store_dir())
+    }
+
+    /// [`Self::for_codebuddy_ide`] 的可测实现：显式传入工具存储根。
+    pub fn for_codebuddy_ide_at(store_root: PathBuf) -> Self {
+        Self {
+            store_root,
+            data_root: PathBuf::new(),
+            auth_file: PathBuf::new(),
+            link_namespace: LinkNamespace::CodeBuddyIde,
+        }
+    }
+
     pub fn workbuddy_db(&self) -> PathBuf {
         self.data_root.join("workbuddy.db")
     }
@@ -125,11 +144,12 @@ impl SessionPaths {
         self.store_root.join("backups")
     }
 
-    /// 关联组主表：WorkBuddy 与 VS Code 插件各一份，互不可见（design §2）。
+    /// 关联组主表：三个目标各一份，互不可见（design §2）。
     pub fn session_links_file(&self) -> PathBuf {
         match self.link_namespace {
             LinkNamespace::WorkBuddy => self.store_root.join("session_links.json"),
             LinkNamespace::VscodeExt => self.store_root.join("vscode_session_links.json"),
+            LinkNamespace::CodeBuddyIde => self.store_root.join("codebuddy_ide_session_links.json"),
         }
     }
 
@@ -138,6 +158,7 @@ impl SessionPaths {
         match self.link_namespace {
             LinkNamespace::WorkBuddy => self.store_root.join("session-links"),
             LinkNamespace::VscodeExt => self.store_root.join("vscode-session-links"),
+            LinkNamespace::CodeBuddyIde => self.store_root.join("codebuddy-ide-session-links"),
         }
     }
 
@@ -169,6 +190,9 @@ impl SessionPaths {
         match self.link_namespace {
             LinkNamespace::WorkBuddy => self.locks_dir().join("session-links.lock"),
             LinkNamespace::VscodeExt => self.locks_dir().join("vscode-session-links.lock"),
+            LinkNamespace::CodeBuddyIde => {
+                self.locks_dir().join("codebuddy-ide-session-links.lock")
+            }
         }
     }
 }
@@ -1145,9 +1169,7 @@ fn finish_copy_from_body(
         DbCopyOutcome::SourceRowMissing => {
             return Err("数据库中找不到源会话记录，未复制".to_string())
         }
-        DbCopyOutcome::NoSessionsTable => {
-            return Err("会话数据缺少数据表，未复制".to_string())
-        }
+        DbCopyOutcome::NoSessionsTable => return Err("会话数据缺少数据表，未复制".to_string()),
         DbCopyOutcome::NoDb => return Err("会话数据不存在，未复制".to_string()),
     }
     verify_session_row(paths, &operation.target.session_id, &operation.target.uid)?;
@@ -2531,7 +2553,8 @@ fn update_target_session_row(
         .map_err(|error| format!("目标会话记录更新失败：{error}"))?;
     if affected != 1 {
         return Err(
-            "目标会话记录归属校验失败：会话不存在、不属于目标账号或已被删除，未按成功处理".to_string(),
+            "目标会话记录归属校验失败：会话不存在、不属于目标账号或已被删除，未按成功处理"
+                .to_string(),
         );
     }
     match (read_session_row(&tx, &target.session_id)?, before) {
@@ -2542,7 +2565,9 @@ fn update_target_session_row(
                 || after.title != before.title
                 || after.custom_title != before.custom_title
             {
-                return Err("目标会话记录的归属或标题在保存期间发生变化，已回滚本次更新".to_string());
+                return Err(
+                    "目标会话记录的归属或标题在保存期间发生变化，已回滚本次更新".to_string()
+                );
             }
             if after.updated_at != Some(new_updated_at) {
                 return Err("目标会话记录更新时间未按本次保存生效，未按成功处理".to_string());
@@ -3515,7 +3540,9 @@ mod tests {
         assert!(paths.session_links_file().ends_with("session_links.json"));
         assert!(paths.session_links_dir().ends_with("session-links"));
         assert!(paths.baselines_dir().ends_with("session-links/baselines"));
-        assert!(paths.preview_tokens_dir().ends_with("session-links/previews"));
+        assert!(paths
+            .preview_tokens_dir()
+            .ends_with("session-links/previews"));
         assert!(paths.operations_dir().ends_with("session-links/operations"));
         assert!(paths
             .link_store_lock_file()
@@ -3528,7 +3555,10 @@ mod tests {
             auth_file: PathBuf::new(),
             link_namespace: LinkNamespace::WorkBuddy,
         };
-        assert_eq!(at_root.session_links_file(), root.join("session_links.json"));
+        assert_eq!(
+            at_root.session_links_file(),
+            root.join("session_links.json")
+        );
         assert_eq!(at_root.session_links_dir(), root.join("session-links"));
         assert_eq!(
             at_root.baselines_dir(),
@@ -3580,10 +3610,7 @@ mod tests {
         assert_ne!(vscode.session_links_file(), workbuddy.session_links_file());
         assert_ne!(vscode.session_links_dir(), workbuddy.session_links_dir());
         assert_ne!(vscode.baselines_dir(), workbuddy.baselines_dir());
-        assert_ne!(
-            vscode.preview_tokens_dir(),
-            workbuddy.preview_tokens_dir()
-        );
+        assert_ne!(vscode.preview_tokens_dir(), workbuddy.preview_tokens_dir());
         assert_ne!(vscode.operations_dir(), workbuddy.operations_dir());
         assert_ne!(
             vscode.link_store_lock_file(),
@@ -3592,6 +3619,54 @@ mod tests {
         // 默认命名空间是 WorkBuddy：`SessionPaths::for_variant` 之外的历史构造点
         // 不会因为新增字段而漂移到 VS Code 名字上。
         assert_eq!(LinkNamespace::default(), LinkNamespace::WorkBuddy);
+    }
+
+    /// 命名空间隔离：CodeBuddy IDE 侧的关联表 / 目录 / 锁与 WorkBuddy、VS Code 都不同，
+    /// 三个目标在同一 `~/.wb-switch` 下并存而不互相污染。
+    #[test]
+    fn codebuddy_ide_link_paths_are_isolated_from_other_namespaces() {
+        let root = std::env::temp_dir().join("wb-switch-store");
+        let workbuddy = SessionPaths {
+            store_root: root.clone(),
+            data_root: PathBuf::new(),
+            auth_file: PathBuf::new(),
+            link_namespace: LinkNamespace::WorkBuddy,
+        };
+        let vscode = SessionPaths::for_vscode_ext_at(root.clone());
+        let ide = SessionPaths::for_codebuddy_ide_at(root.clone());
+        assert_eq!(ide.store_root, workbuddy.store_root);
+        assert_eq!(
+            ide.session_links_file(),
+            root.join("codebuddy_ide_session_links.json")
+        );
+        assert_eq!(
+            ide.session_links_dir(),
+            root.join("codebuddy-ide-session-links")
+        );
+        assert_eq!(
+            ide.baselines_dir(),
+            root.join("codebuddy-ide-session-links").join("baselines")
+        );
+        assert_eq!(
+            ide.link_store_lock_file(),
+            root.join("locks").join("codebuddy-ide-session-links.lock")
+        );
+        assert_eq!(
+            ide.preview_tokens_dir(),
+            root.join("codebuddy-ide-session-links").join("previews")
+        );
+        assert_eq!(
+            ide.operations_dir(),
+            root.join("codebuddy-ide-session-links").join("operations")
+        );
+        for other in [&workbuddy, &vscode] {
+            assert_ne!(ide.session_links_file(), other.session_links_file());
+            assert_ne!(ide.session_links_dir(), other.session_links_dir());
+            assert_ne!(ide.baselines_dir(), other.baselines_dir());
+            assert_ne!(ide.preview_tokens_dir(), other.preview_tokens_dir());
+            assert_ne!(ide.operations_dir(), other.operations_dir());
+            assert_ne!(ide.link_store_lock_file(), other.link_store_lock_file());
+        }
     }
 
     #[test]
@@ -4039,7 +4114,11 @@ mod tests {
         assert!(session_backup::scan_lifecycle(&env.paths)
             .records
             .is_empty());
-        assert_eq!(env.body_files().len(), 4, "两条来源内容与两个复制后的内容都在");
+        assert_eq!(
+            env.body_files().len(),
+            4,
+            "两条来源内容与两个复制后的内容都在"
+        );
     }
 
     /// 归属不可验证（临时目录路径被替换为符号链接）：业务成功保持不变、材料保留并上报，
@@ -5357,7 +5436,10 @@ mod tests {
         assert_eq!(group["extraB"], 5);
         assert_eq!(group["availableModes"], json!([]));
         assert!(group.get("previewToken").is_none(), "不可勾选的组不发凭据");
-        assert!(group["reason"].as_str().unwrap().contains("只有目标账号新增"));
+        assert!(group["reason"]
+            .as_str()
+            .unwrap()
+            .contains("只有目标账号新增"));
 
         // 预览不写目标：正文与关联版本都不变。
         assert_eq!(
@@ -5398,7 +5480,10 @@ mod tests {
         assert_eq!(group["availableModes"], json!([]));
         assert!(group.get("previewToken").is_none(), "不可执行的组不发凭据");
         assert!(
-            group["reason"].as_str().unwrap().contains("对应的会话已失效"),
+            group["reason"]
+                .as_str()
+                .unwrap()
+                .contains("对应的会话已失效"),
             "{preview}"
         );
         // 契约：不可验证时 source/target 为 0、baseline 为 null（前端类型据此声明）。
@@ -5431,7 +5516,10 @@ mod tests {
         let skipped = &report["skipped"][0];
         assert_eq!(skipped["reasonCode"], REASON_PREVIEW_STALE);
         assert!(
-            skipped["message"].as_str().unwrap().contains("当前账号的内容已变化"),
+            skipped["message"]
+                .as_str()
+                .unwrap()
+                .contains("当前账号的内容已变化"),
             "{skipped}"
         );
         assert_eq!(
@@ -5454,7 +5542,10 @@ mod tests {
             let skipped = &report["skipped"][0];
             assert_eq!(skipped["reasonCode"], REASON_PREVIEW_STALE, "{report}");
             assert!(
-                skipped["message"].as_str().unwrap().contains("目标账号的内容已变化"),
+                skipped["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("目标账号的内容已变化"),
                 "{skipped}"
             );
         }
