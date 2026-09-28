@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, CircleAlert, ExternalLink, Folder, Loader2 }
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 
+import { AccountNoteChip, accountNote } from "@/components/account-note-chip";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -348,6 +349,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   /** 覆盖项数量：底部摘要据此提示风险。 */
   const overwriteCount = syncSelections.filter((item) => item.mode === "overwrite").length;
   const linksAvailable = linksMeta?.available ?? true;
+  /** 目标账号的备注（XBuddy 分支自有字段）；空串按「没写」处理。 */
+  const note = accountNote(account);
   const summaryMain =
     copyCount > 0 && syncCount > 0
       ? `将复制 ${copyCount} 个、同步 ${syncCount} 个关联会话`
@@ -520,6 +523,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         <DialogHeader className="shrink-0">
           <DialogTitle>切换到「{account?.nickname || account?.email || account?.uid || "该账号"}」</DialogTitle>
           <DialogDescription>切换时将重启 {variantAppName(accountVariant(account))}。</DialogDescription>
+          {/* 备注跟在这里：点下「确认切换」之前最后一眼就能核对是不是想切的那个号，比回列表翻更可靠。 */}
+          {note && <AccountNoteChip note={note} />}
         </DialogHeader>
 
         {busy && (

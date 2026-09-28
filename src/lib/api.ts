@@ -135,6 +135,7 @@ const ROUTES: Record<string, Route> = {
     path: "/api/codebuddy-ide/session-links",
   },
   delete_account: { method: "POST", path: "/api/delete" },
+  set_account_note: { method: "POST", path: "/api/account-note" },
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
   import_local: { method: "POST", path: "/api/import-local" },
@@ -465,6 +466,17 @@ export function detectCodebuddyIdeAccount(): Promise<{
 
 export function deleteAccount(accountId: string): Promise<{ ok: boolean }> {
   return call("delete_account", { accountId });
+}
+
+/**
+ * 写入账号备注。传空串（或纯空白）即清除备注。
+ * 返回写入后的账号元数据，调用方可直接替换列表里的那一行。
+ */
+export function setAccountNote(
+  accountId: string,
+  note: string,
+): Promise<{ ok: boolean; account: AccountMeta }> {
+  return call("set_account_note", { accountId, note });
 }
 
 /** 发起登录：国内版为扫码授权，国际版为浏览器 Web 登录授权；`variant` 缺省为国内版（档位由后端记忆，轮询无需再传）。 */

@@ -15,6 +15,8 @@ import {
 } from "lucide-react";
 
 import { AccountCard } from "@/components/account-card";
+import { AccountNoteChip, accountNote } from "@/components/account-note-chip";
+import { AccountNoteDialog } from "@/components/account-note-dialog";
 import { JetbrainsSwitchDialog } from "@/components/jetbrains-switch-dialog";
 import { CodebuddyIdeSwitchAccountDialog } from "@/components/codebuddy-ide-switch-account-dialog";
 import { DemoAction } from "@/components/demo-action";
@@ -165,6 +167,7 @@ export default function AccountsPage() {
     error,
     fetchAll,
     deleteAccount,
+    reconcileAccounts,
     importLocal,
     creditMap,
     creditLoadingMap,
@@ -221,6 +224,8 @@ export default function AccountsPage() {
   const [cliSwitchTarget, setCliSwitchTarget] = useState<AccountMeta | null>(null);
   /** 删除账号确认目标（null=关闭） */
   const [deleteTarget, setDeleteTarget] = useState<AccountMeta | null>(null);
+  /** 账号备注编辑目标（null=关闭）；备注是 XBuddy 分支自有字段，用来分辨每个号主要干嘛。 */
+  const [noteTarget, setNoteTarget] = useState<AccountMeta | null>(null);
   /** 当前档位下的账号：列表、计数、签到、积分等一律只作用于当前档位。 */
   const visibleAccounts = useMemo(
     () => accounts.filter((account) => accountVariant(account) === variant),
@@ -782,6 +787,8 @@ export default function AccountsPage() {
   const cliSwitchAccountLabel = cliSwitchTarget
     ? cliSwitchTarget.nickname || cliSwitchTarget.email || cliSwitchTarget.id
     : "";
+  /** CLI 切换确认弹窗里也带上备注：切换会中断当前 CLI 会话，切错成本比其它端更高。 */
+  const cliSwitchNote = accountNote(cliSwitchTarget);
   const workbuddyCurrentName = current
     ? current.nickname || current.email || current.uid || "未知账号"
     : "未登录";
@@ -1086,6 +1093,7 @@ export default function AccountsPage() {
                 account={a}
                 compact={compact}
                 onDelete={onDelete}
+                onEditNote={setNoteTarget}
                 onSwitch={setSwitchAccount}
                 onCheckin={checkinAvailable ? onCheckin : undefined}
                 onRefresh={onRefresh}
@@ -1128,6 +1136,16 @@ export default function AccountsPage() {
       </section>
 
       <OAuthLoginDialog open={oauthOpen} onOpenChange={setOauthOpen} variant={variant} />
+      <AccountNoteDialog
+        open={noteTarget !== null}
+        onOpenChange={(o) => {
+          if (!o) setNoteTarget(null);
+        }}
+        account={noteTarget}
+        // 只同步账号列表（含刚写入的 note）。这里刻意不走 `fetchAll()`：
+        // 备注不影响登录态与积分，没必要连带重拉状态、重算积分排序。
+        onSaved={() => void reconcileAccounts()}
+      />
       <ExportAccountsDialog
         open={exportOpen}
         onOpenChange={setExportOpen}
@@ -1235,6 +1253,7 @@ export default function AccountsPage() {
               将把 CodeBuddy CLI 默认账号设为「{cliSwitchAccountLabel}」。
               确认后会关闭正在运行的 CodeBuddy CLI 会话，当前会话会中断；重新打开 CLI 后新账号才会生效。
             </DialogDescription>
+            {cliSwitchNote && <AccountNoteChip note={cliSwitchNote} />}
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCliSwitchTarget(null)}>

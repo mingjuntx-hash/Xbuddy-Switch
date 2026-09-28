@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
+import { AccountNoteChip, accountNote } from "@/components/account-note-chip";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -50,6 +51,8 @@ export function JetbrainsSwitchDialog({ open, onOpenChange, account, jetbrainsSt
 
   const checked = selected ?? targets.map((t) => t.configDir);
   const allChecked = targets.length > 0 && checked.length === targets.length;
+  /** 目标账号的备注（XBuddy 分支自有字段）：切换前最后一眼核对「切的是不是我想的号」。 */
+  const note = accountNote(account);
 
   function toggle(dir: string, on: boolean) {
     setSelected((prev) => {
@@ -101,6 +104,7 @@ export function JetbrainsSwitchDialog({ open, onOpenChange, account, jetbrainsSt
               "选择要写入的 IDE。"
             )}
           </DialogDescription>
+          {note && <AccountNoteChip note={note} />}
         </DialogHeader>
 
         {targets.length === 0 ? (

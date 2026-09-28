@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { CircleCheck, Loader2, RefreshCw, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 
+import { AccountNoteChip, accountNote } from "@/components/account-note-chip";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
@@ -253,6 +254,8 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
   const overwriteCount = syncSelections.filter((item) => item.mode === "overwrite").length;
   /** 关联会话 tab 是否可用：区块不可用（能力判定不通过）时回落到仅复制会话。 */
   const linksAvailable = linksMeta?.available ?? true;
+  /** 目标账号的备注（XBuddy 分支自有字段）：切换前最后一眼核对「切的是不是我想的号」。 */
+  const note = accountNote(account);
   const summaryMain =
     copyCount > 0 && syncCount > 0
       ? `将复制 ${copyCount} 个、同步 ${syncCount} 个关联会话`
@@ -392,6 +395,7 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
           <DialogDescription>
             将把所选账号写入 VS Code CodeBuddy 插件；可选把当前账号的会话复制过去，并把关联会话的新内容同步过去。
           </DialogDescription>
+          {note && <AccountNoteChip note={note} />}
         </DialogHeader>
 
         {busy && (

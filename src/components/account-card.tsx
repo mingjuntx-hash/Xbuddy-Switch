@@ -1,6 +1,7 @@
-import { ArrowRight, CalendarCheck2, CalendarDays, CalendarOff, Check, CircleCheck, Clock3, Coins, Ellipsis, Gauge, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
+import { ArrowRight, CalendarCheck2, CalendarDays, CalendarOff, Check, CircleCheck, Clock3, Coins, Ellipsis, Gauge, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, StickyNote, Trash2 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 
+import { AccountNoteChip, accountNote } from "@/components/account-note-chip";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { DemoAction } from "@/components/demo-action";
@@ -283,6 +284,8 @@ function rateLimitChip(limits: RateLimitEntry[] | undefined, now: number) {
 interface Props {
   account: AccountMeta;
   onDelete: (a: AccountMeta) => void;
+  /** 编辑账号备注（本分支自有功能）；未提供时卡片不渲染可点击的备注 chip。 */
+  onEditNote?: (a: AccountMeta) => void;
   onCheckin?: (a: AccountMeta) => void;
   onRefresh?: (a: AccountMeta) => void;
   onSwitch?: (a: AccountMeta) => void;
@@ -429,7 +432,7 @@ function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?:
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, jetbrainsInstalled, jetbrainsPluginInstalled, jetbrainsAvailable, jetbrainsActive, jetbrainsBusy, jetbrainsLoading, onSwitchJetbrains, enabledTools, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onEditNote, onCheckin, onRefresh, onSwitch, todayCheckedIn, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, jetbrainsInstalled, jetbrainsPluginInstalled, jetbrainsAvailable, jetbrainsActive, jetbrainsBusy, jetbrainsLoading, onSwitchJetbrains, enabledTools, featuresDisabled = true, compact = false }: Props) {
   /** 支持工具开关：关闭的端整块不渲染（缺省视为开启）。 */
   const toolEnabled = (id: ToolId) => enabledTools?.[id] !== false;
   const [resourcesOpen, setResourcesOpen] = useState(false);
@@ -446,6 +449,10 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
   const name = account.nickname || account.uid || "未命名账号";
   const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
   const avatarClass = avatarTone(name);
+  const note = accountNote(account);
+  /** 备注可点击编辑：演示模式整体只读；调用方没给入口时也只展示、不做按钮。 */
+  const noteEditable = !demoModeEnabled && Boolean(onEditNote);
+  const openNoteEditor = onEditNote ? () => onEditNote(account) : undefined;
   const resources = creditResources(credit);
   const visibleResources = resources.slice(0, 2);
   const expiringAmount = credit?.ok ? credit.expiringSoonRemaining ?? 0 : 0;
@@ -570,6 +577,12 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-40">
+                {/* 备注放在最上面并独立分组：它是账号自身的标识信息，与下面的刷新/签到等操作不同类。 */}
+                <DropdownMenuItem disabled={!onEditNote} onSelect={() => onEditNote?.(account)}>
+                  <StickyNote />
+                  {note ? "编辑备注" : "添加备注"}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
                 <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
                   <RefreshCw />刷新 Token
                 </DropdownMenuItem>
@@ -587,8 +600,11 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
           )}
         </div>
 
+        {/* 紧凑模式默认开启、是最常见的形态：一行里已经排着账号名、状态 chip 和一整排工具图标按钮，
+            备注再挤进同一行就会把账号名压成两三个字。所以容器允许换行，让备注独占下一行
+            （规则写在行尾那枚 chip 的注释里）。 */}
         {compact ? (
-          <div className="relative z-10 flex w-full min-w-0 items-center gap-2 pr-10">
+          <div className="relative z-10 flex w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pr-10">
             <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-5" title={name}>{name}</h3>
             <div className="hidden shrink-0 items-center gap-1 min-[420px]:flex">{statusChips}</div>
             <div className="ml-auto flex shrink-0 items-center gap-1">
@@ -721,6 +737,19 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                 </Tooltip>
               ))}
             </div>
+            {/* 备注放在行尾并强制占满一整行（`basis-full`）：紧凑模式一行里已经有账号名、
+                状态 chip 和一整排工具图标按钮，备注再挤在同一行会把账号名压成两三个字 ——
+                而"一眼看出这是哪个号"恰恰是备注存在的全部理由。
+                `basis-full` 让它在换行容器里必然独占下一行，宽度也就随卡片铺开，
+                无论备注长短都不会反过来挤压第一行。 */}
+            {note && (
+              <AccountNoteChip
+                className="basis-full shrink-0"
+                note={note}
+                editable={noteEditable}
+                onEdit={openNoteEditor}
+              />
+            )}
           </div>
         ) : (
           <div className={cn("relative z-10 flex w-full min-w-0 items-center gap-3", workbuddyActive || codebuddyCliActive ? "pr-[112px]" : "pr-10")}>
@@ -728,6 +757,14 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
             <div className="min-w-0 flex-1">
               <h3 className="truncate text-sm font-semibold leading-5" title={name}>{name}</h3>
               <p className="mt-0.5 truncate text-xs leading-5 text-muted-foreground" title={account.email || account.uid || account.id}>{accountIdentity(account)}</p>
+              {note && (
+                <AccountNoteChip
+                  className="mt-1"
+                  note={note}
+                  editable={noteEditable}
+                  onEdit={openNoteEditor}
+                />
+              )}
               <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5">{statusChips}</div>
             </div>
           </div>

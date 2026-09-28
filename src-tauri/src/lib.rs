@@ -210,6 +210,7 @@ pub fn run() {
             commands::switch_jetbrains_account,
             commands::detect_jetbrains_account,
             commands::delete_account,
+            commands::set_account_note,
             commands::oauth_start,
             commands::oauth_status,
             commands::import_local,

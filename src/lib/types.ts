@@ -20,6 +20,8 @@ export interface AccountMeta {
   needsReloginReason: string | null;
   /** 账号所属档位；缺省（旧后端/历史账号）按国内版处理。 */
   variant?: WbVariant;
+  /** 用户自填备注（XBuddy 分支自有字段，用于分辨每个账号主要干嘛）。未填写为 null。 */
+  note?: string | null;
 }
 
 export interface AppStatus {

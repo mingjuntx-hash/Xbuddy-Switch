@@ -118,6 +118,10 @@ pub fn account_meta(acc: &Value) -> Value {
         "needsReloginReason": display_value(acc, "needs_relogin_reason"),
         // 档位随元数据下发，供宿主按档位过滤列表（缺省国内版，历史数据零迁移）。
         "variant": variant_of(acc).as_str(),
+        // 用户自填备注（XBuddy 分支自有字段）。上游不识别该键，但账号库走 `Value`
+        // 透传，读到未知键原样保留，因此本字段与上游/其它端共存不冲突。
+        // 未填写时下发 Null（而非缺键），前端判定统一。
+        "note": display_value(acc, "note"),
     })
 }
 
@@ -245,6 +249,19 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
             collected["createdAt"] = created_at;
         }
         inherit_existing_variant(existing, &mut collected);
+
+        // 用户自填备注（XBuddy 分支自有字段）不属于「采集到的」信息：本机重导入与
+        // OAuth 扫码重加拿到的记录里都没有这个键，而下面是把 collected 整体覆盖上去，
+        // 不继承就会**静默抹掉**用户写的备注。这不是边角场景——
+        // 信封态凭据的标准补救路径就是「删掉后用扫码重新添加」（见 envelope_token_error），
+        // 那条路的代价不该是丢备注。
+        //
+        // 采集记录自带 note 时不覆盖：那是明确携带备注的写入（如导出文件回导），以它为准。
+        if get_str(&collected, "note").is_none() {
+            if let Some(note) = existing.get("note").filter(|v| v.is_string()).cloned() {
+                collected["note"] = note;
+            }
+        }
 
         for index in matching_indexes.into_iter().rev() {
             accounts.remove(index);
@@ -376,6 +393,43 @@ pub fn build_auth_headers(account: &Value) -> HashMap<String, String> {
 /// 删除账号（按 id）。
 pub fn delete_account(account_id: &str) -> Result<(), String> {
     delete_account_from_path(&accounts_file(), account_id)
+}
+
+/// 写入账号备注（`note`）。首尾空白裁剪；结果为空串则删除该键（不留 `"note": ""`）。
+///
+/// 备注是本分支自有的展示字段，用途是「一眼看出每个账号主要干嘛」。写回保持账号库
+/// 原有 JSON 数组结构，其余键（含 `$wbEncrypted` 信封）原样不动。
+/// 返回写入后的账号元数据，供前端直接刷新该行。
+pub fn set_note(account_id: &str, note: &str) -> Result<Value, String> {
+    set_note_at(&accounts_file(), account_id, note)
+}
+
+fn set_note_at(path: &Path, account_id: &str, note: &str) -> Result<Value, String> {
+    let mut accounts = load_accounts_from_path(path);
+    let trimmed = note.trim();
+    let mut hit = false;
+    for acc in accounts.iter_mut() {
+        let matches = acc.get("id").and_then(Value::as_str) == Some(account_id)
+            || acc.get("uid").and_then(Value::as_str) == Some(account_id);
+        if !matches {
+            continue;
+        }
+        let obj = acc.as_object_mut().ok_or("账号记录格式异常")?;
+        if trimmed.is_empty() {
+            obj.remove("note");
+        } else {
+            obj.insert("note".to_string(), Value::String(trimmed.to_string()));
+        }
+        hit = true;
+        break;
+    }
+    if !hit {
+        return Err("账号不存在".to_string());
+    }
+    save_accounts_to_path(path, &accounts).map_err(|e| e.to_string())?;
+    find_account_in(&accounts, account_id)
+        .map(|acc| account_meta(&acc))
+        .ok_or_else(|| "账号不存在".to_string())
 }
 
 /// 导入本机当前账号（从该档位的登录态文件读取）。
@@ -870,6 +924,160 @@ mod tests {
         delete_account_from_path(&path, "account-2").expect("second account should delete");
         assert!(load_accounts_from_path(&path).is_empty());
         std::fs::remove_dir_all(&test_dir).expect("temporary account store should clean up");
+    }
+
+    /// 备注写入：值可读回、其余字段（含凭据）不动。
+    #[test]
+    fn note_round_trips_and_keeps_other_fields() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "wb-switch-note-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = test_dir.join("accounts.json");
+        let accounts = vec![account("account-1", Some("uid-1"), "徐", None)];
+        save_accounts_to_path(&path, &accounts).unwrap();
+
+        let meta = set_note_at(&path, "account-1", "  画室主号 · 主力  ").expect("note 应写入");
+        assert_eq!(meta["note"], json!("画室主号 · 主力"), "首尾空白应被裁剪");
+        assert_eq!(meta["nickname"], json!("徐"));
+
+        let persisted = load_accounts_from_path(&path);
+        let row = find_account_in(&persisted, "account-1").unwrap();
+        assert_eq!(row["note"], json!("画室主号 · 主力"));
+        assert_eq!(row["access_token"], json!("token-account-1"), "凭据不得被改动");
+        assert_eq!(row["uid"], json!("uid-1"));
+
+        // account_meta 也要下发该字段
+        assert_eq!(account_meta(&row)["note"], json!("画室主号 · 主力"));
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    /// 空备注等于清除：键应被移除，而不是留下 `"note": ""`。
+    #[test]
+    fn blank_note_removes_the_key() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "wb-switch-note-clear-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = test_dir.join("accounts.json");
+        let mut accounts = vec![account("account-1", Some("uid-1"), "徐", None)];
+        accounts[0]["note"] = json!("先写一条");
+        save_accounts_to_path(&path, &accounts).unwrap();
+
+        let meta = set_note_at(&path, "account-1", "   ").expect("空白应视为清除");
+        assert_eq!(meta["note"], Value::Null, "清除后 account_meta 下发 Null");
+
+        let persisted = load_accounts_from_path(&path);
+        let row = find_account_in(&persisted, "account-1").unwrap();
+        assert!(
+            row.as_object().unwrap().get("note").is_none(),
+            "键必须被删除，不能留空串"
+        );
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    /// 未填备注的历史账号：`account_meta` 下发 Null，不报错、不影响其余字段。
+    #[test]
+    fn missing_note_reports_null() {
+        let row = account("account-1", Some("uid-1"), "徐", None);
+        assert_eq!(account_meta(&row)["note"], Value::Null);
+    }
+
+    /// 账号不存在要显式报错，不能静默写坏文件。
+    #[test]
+    fn note_rejects_unknown_account() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "wb-switch-note-missing-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = test_dir.join("accounts.json");
+        save_accounts_to_path(&path, &[account("account-1", Some("uid-1"), "徐", None)]).unwrap();
+
+        let err = set_note_at(&path, "nope", "随便").unwrap_err();
+        assert_eq!(err, "账号不存在");
+        // 原样保留
+        assert_eq!(load_accounts_from_path(&path).len(), 1);
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    /// 备注不得吞掉 WorkBuddy 5.6 的加密信封字段（写回是整条记录重写）。
+    #[test]
+    fn note_write_keeps_encrypted_envelope() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "wb-switch-note-envelope-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = test_dir.join("accounts.json");
+        let mut row = account("account-1", Some("uid-1"), "徐", None);
+        row["access_token"] = json!({"$wbEncrypted": 1, "envelope": "AAA="});
+        save_accounts_to_path(&path, &[row]).unwrap();
+
+        set_note_at(&path, "account-1", "小号").unwrap();
+
+        let persisted = load_accounts_from_path(&path);
+        let row = find_account_in(&persisted, "account-1").unwrap();
+        assert_eq!(row["access_token"]["$wbEncrypted"], json!(1));
+        assert_eq!(row["access_token"]["envelope"], json!("AAA="));
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    /// 本机重导入 / 扫码重加不得抹掉用户写的备注。
+    ///
+    /// 上面那组 `note_*` 测试只证明「能写能读」；这条守的是「写完不会被别的路径冲掉」——
+    /// 采集到的记录里没有 `note` 键，而 `upsert_collected_account` 是整体覆盖。
+    #[test]
+    fn reimport_keeps_user_note() {
+        let mut existing = account("account-1", Some("uid-1"), "徐", None);
+        existing["note"] = json!("画室主号 · 主力");
+        let mut accounts = vec![existing];
+
+        let saved = upsert_collected_account(
+            &mut accounts,
+            account("account-1", Some("uid-1"), "徐", None),
+        );
+
+        assert_eq!(saved["note"], json!("画室主号 · 主力"), "重导入不得丢备注");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["note"], json!("画室主号 · 主力"));
+        // 覆盖分支的其他既有行为不受影响（id 仍是本地稳定值、token 换成新采集的）
+        assert_eq!(saved["id"], json!("account-1"));
+        assert_eq!(saved["access_token"], json!("token-account-1"));
+    }
+
+    /// 采集记录自带备注时以它为准（导出文件回导等明确携带 `note` 的写入）。
+    #[test]
+    fn collected_note_wins_when_present() {
+        let mut existing = account("account-1", Some("uid-1"), "徐", None);
+        existing["note"] = json!("旧备注");
+        let mut accounts = vec![existing];
+
+        let mut incoming = account("account-1", Some("uid-1"), "徐", None);
+        incoming["note"] = json!("新备注");
+
+        let saved = upsert_collected_account(&mut accounts, incoming);
+
+        assert_eq!(saved["note"], json!("新备注"));
+    }
+
+    /// 新追加的账号没有备注：不留 `note` 键，`account_meta` 仍下发 Null。
+    #[test]
+    fn appended_account_has_no_note_key() {
+        let mut accounts = Vec::new();
+
+        let saved = upsert_collected_account(
+            &mut accounts,
+            account("account-1", Some("uid-1"), "徐", None),
+        );
+
+        assert!(
+            saved.as_object().unwrap().get("note").is_none(),
+            "没写备注就不该凭空多出这个键"
+        );
+        assert_eq!(account_meta(&saved)["note"], Value::Null);
     }
 }
 

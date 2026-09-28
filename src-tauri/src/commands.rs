@@ -440,6 +440,13 @@ pub fn delete_account(account_id: String) -> Result<Value, String> {
     Ok(json!({ "ok": true }))
 }
 
+/// POST /api/account-note —— 写入账号备注（XBuddy 分支自有字段，便于分辨各账号用途）。
+/// 传空白串即清除备注。返回写入后的账号元数据。
+#[tauri::command]
+pub fn set_account_note(account_id: String, note: String) -> Result<Value, String> {
+    account::set_note(&account_id, &note).map(|meta| json!({ "ok": true, "account": meta }))
+}
+
 /// POST /api/oauth/start —— 发起 OAuth 扫码登录（`variant` 缺省国内版）。
 #[tauri::command]
 pub async fn oauth_start(variant: Option<String>) -> Result<Value, String> {

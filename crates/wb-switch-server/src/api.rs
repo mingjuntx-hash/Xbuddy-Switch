@@ -110,6 +110,7 @@ pub fn router() -> Router {
             post(api_vscode_ext_session_links_preview),
         )
         .route("/api/delete", post(api_delete))
+        .route("/api/account-note", post(api_set_account_note))
         .route("/api/oauth/start", post(api_oauth_start))
         .route("/api/oauth/status", post(api_oauth_status))
         .route("/api/import-local", post(api_import_local))
@@ -609,6 +610,17 @@ async fn api_delete(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
     match account::delete_account(id) {
         Ok(()) => json_ok(json!({ "ok": true })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/account-note —— 写入账号备注（XBuddy 分支自有字段）。
+/// `note` 传空串即清除。返回写入后的账号元数据。
+async fn api_set_account_note(Json(body): Json<Value>) -> Response {
+    let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
+    let note = body.get("note").and_then(|v| v.as_str()).unwrap_or("");
+    match account::set_note(id, note) {
+        Ok(meta) => json_ok(json!({ "ok": true, "account": meta })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
 }
