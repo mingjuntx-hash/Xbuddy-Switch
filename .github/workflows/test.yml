@@ -113,3 +113,21 @@ jobs:
       # server 的 8 个测试此前从不运行（rust-tests 只覆盖 core）。
       - name: Server tests
         run: cargo test -p wb-switch-server
+
+      # src-tauri 的 40 个测试此前从不运行（rust-tests 只覆盖 core）。
+      # 前置 dist 与 stub companion binary 已由上方步骤就位。
+      - name: Desktop app tests
+        run: cargo test -p wb-switch-rust
+
+  # 前端行为测试：纯逻辑单测（node 环境），不依赖 Rust 工具链。
+  frontend-tests:
+    name: frontend-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test

@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { ArrowUp, Loader2, MessagesSquare, Play, Settings, Sparkles, User } from "lucide-react";
+import { ArrowUp, Link2, Loader2, MessagesSquare, Play, Settings, Sparkles, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import AccountsPage from "@/pages/AccountsPage";
+import SessionsPage from "@/pages/SessionsPage";
 import CreditStatsPage from "@/pages/CreditStatsPage";
 import TokenStatsPage from "@/pages/TokenStatsPage";
 import SettingsPage from "@/pages/SettingsPage";
@@ -18,8 +19,8 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { Toaster } from "@/components/ui/sonner";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import companionTrayIcon from "@/assets/agent-companion-tray.png";
 import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
+import { useSessionsNavEnabled } from "@/lib/nav-prefs";
 import { changeCompanionEnabled, useCompanionEnabled } from "@/lib/use-companion-enabled";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
 import { useRotateDeferredNotice } from "@/lib/use-rotate-deferred-notice";
@@ -66,7 +67,7 @@ function CompanionFooter() {
         <TooltipTrigger asChild>
           <DropdownMenuTrigger asChild>
             <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0 rounded-lg" aria-label="会话悬浮窗" disabled={enabled === null || busy}>
-              <img src={companionTrayIcon} alt="" className={cn("size-6 object-contain transition-all", !enabled && "grayscale opacity-55")} />
+              <AppIconMark size={24} className={cn("transition-all", !enabled && "opacity-55 grayscale")} />
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
@@ -121,7 +122,7 @@ function CompanionDemoFooter() {
         <TooltipTrigger asChild>
           <DropdownMenuTrigger asChild>
             <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0 rounded-lg" aria-label="会话悬浮窗">
-              <img src={companionTrayIcon} alt="" className="size-6 object-contain" />
+              <AppIconMark size={24} />
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
@@ -220,6 +221,7 @@ function Layout() {
   const running = useAccountsStore((s) => s.status?.running);
   const hasUnifiedTitleBar =
     api.isDesktop() && typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
+  const sessionsNavEnabled = useSessionsNavEnabled();
   useCreditAutoRefresh();
   useWorkbuddyStatusRefresh();
   useRotateDeferredNotice();
@@ -274,6 +276,22 @@ function Layout() {
             <User className="size-4" />
             账号管理
           </NavLink>
+          {sessionsNavEnabled && (
+            <NavLink
+              to="/sessions"
+              className={({ isActive }) =>
+                cn(
+                  "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                  isActive
+                    ? "bg-foreground/[0.06] font-medium text-foreground"
+                    : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+                )
+              }
+            >
+              <Link2 className="size-4" />
+              关联会话
+            </NavLink>
+          )}
           <NavLink to="/token-stats" className={({ isActive }) => cn("flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors", isActive ? "bg-foreground/[0.06] font-medium text-foreground" : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground")}><MessagesSquare className="size-4" />Token 统计</NavLink>
           <NavLink
             to="/credit-stats"
@@ -327,6 +345,7 @@ export default function App() {
         <Routes>
           <Route element={<Layout />}>
             <Route path="/" element={<AccountsPage />} />
+            <Route path="/sessions" element={<SessionsPage />} />
             <Route path="/credit-stats" element={<CreditStatsPage />} />
             <Route path="/token-stats" element={<TokenStatsPage />} />
             <Route path="/settings" element={<SettingsPage />} />

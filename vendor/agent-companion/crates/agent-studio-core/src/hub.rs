@@ -2,6 +2,9 @@ use crate::{now, text};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 pub const STALE: i64 = 45 * 60 * 1000;
+/// Optional waits stop blocking after this window, matching the host app's own
+/// 60-second no-interaction auto-resolution.
+pub const OPTIONAL_TTL_MS: i64 = 60_000;
 pub fn terminal(s: &str) -> bool {
     matches!(s, "done" | "error" | "aborted")
 }
@@ -133,7 +136,13 @@ impl Hub {
             "wait" if !terminal(&text(&s["status"])) => {
                 let a = s["pending"].as_array_mut().unwrap();
                 if !a.iter().any(|x| x["id"] == ev["callId"]) {
-                    a.push(json!({"id":ev["callId"],"tool":ev["tool"],"text":text(&ev["text"]).chars().take(500).collect::<String>(),"questions":ev["questions"].as_array().cloned().unwrap_or_default(),"ts":ts}));
+                    let mut item = json!({"id":ev["callId"],"tool":ev["tool"],"text":text(&ev["text"]).chars().take(500).collect::<String>(),"questions":ev["questions"].as_array().cloned().unwrap_or_default(),"ts":ts});
+                    // Only async Codex questions are optional; every other
+                    // source keeps an item that never expires on its own.
+                    if ev["optional"] == true {
+                        item["optional"] = json!(true);
+                    }
+                    a.push(item);
                 }
                 s["status"] = json!("wait");
                 event = Some(("wait".to_owned(), ev["callId"].clone()));
@@ -206,6 +215,16 @@ impl Hub {
             })
             .cloned()
             .map(|mut s| {
+                // An optional wait expires lazily on read: the host app hides
+                // its own question card after the user stops interacting, so a
+                // stale item must not keep the session in `wait`.
+                s["pending"].as_array_mut().unwrap().retain(|p| {
+                    !(p["optional"] == true
+                        && time - p["ts"].as_i64().unwrap_or(0) > OPTIONAL_TTL_MS)
+                });
+                if s["status"] == "wait" && s["pending"].as_array().unwrap().is_empty() {
+                    s["status"] = json!("running");
+                }
                 let stale = !terminal(&text(&s["status"]))
                     && s["pending"].as_array().is_some_and(|a| a.is_empty())
                     && time - s["updatedAt"].as_i64().unwrap_or(0) > STALE;

@@ -174,12 +174,15 @@ pub fn build_auth_obj(acc: &Value) -> Value {
 
 /// 把账号写入官方认证文件（原子写 + 写后校验）。对照 server.py `write_account_to_auth_file`。
 pub fn write_account_to_auth_file(acc: &Value, variant: WbVariant) -> Result<(), String> {
-    let path = auth_file_path(variant);
+    write_account_to_auth_file_at(acc, &auth_file_path(variant))
+}
+
+fn write_account_to_auth_file_at(acc: &Value, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let existing = read_auth_file(variant).unwrap_or_else(|| json!({}));
+    let existing = read_auth_file_at(path).unwrap_or_else(|| json!({}));
     eprintln!(
         "[auth] write_account: existing is_object={} allAccounts_len={}",
         existing.is_object(),
@@ -224,7 +227,7 @@ pub fn write_account_to_auth_file(acc: &Value, variant: WbVariant) -> Result<(),
         "allAccounts": &all,
     });
     let content = serde_json::to_string_pretty(&session).map_err(|e| e.to_string())?;
-    if let Err(e) = atomic_write(&path, &content) {
+    if let Err(e) = atomic_write(path, &content) {
         eprintln!("[auth] atomic_write FAILED: {e}");
         if e.kind() == std::io::ErrorKind::PermissionDenied {
             return Err(
@@ -237,7 +240,7 @@ pub fn write_account_to_auth_file(acc: &Value, variant: WbVariant) -> Result<(),
 
     // 写后校验：按值比较（token 可能是明文字符串，也可能是 WorkBuddy 5.6 加密信封对象）
     let written: Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
+        serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     let written_token = written
         .get("auth")
@@ -248,7 +251,28 @@ pub fn write_account_to_auth_file(acc: &Value, variant: WbVariant) -> Result<(),
     if written_token != expect_token {
         return Err("认证文件写后校验失败，未写入目标账号".to_string());
     }
+
+    // WorkBuddy 优先读取退出标记：即使认证文件已有凭据，标记仍存在时也视为未登录。
+    // 必须在写入及校验成功后清理；失败时保留退出状态，并阻止调用方报告切换成功。
+    let marker = logout_marker_path(path);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "清理 WorkBuddy 退出标记失败（{}）：{error}",
+                marker.display()
+            ));
+        }
+    }
     Ok(())
+}
+
+/// 官方退出标记是在完整认证文件名后追加后缀，不能替换 `.info` 扩展名。
+fn logout_marker_path(auth_path: &Path) -> PathBuf {
+    let mut marker = auth_path.as_os_str().to_os_string();
+    marker.push(".logged-out");
+    PathBuf::from(marker)
 }
 
 fn setdefault(map: &mut Map<String, Value>, key: &str, value: Value) {
@@ -346,6 +370,136 @@ fn parse_ts(v: Option<&Value>) -> Option<i64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct TempAuthDir(PathBuf);
+
+    impl TempAuthDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "wb-switch-auth-file-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn auth_path(&self, variant: WbVariant) -> PathBuf {
+            self.0.join(auth_file_path(variant).file_name().unwrap())
+        }
+
+        fn marker_path(&self, variant: WbVariant) -> PathBuf {
+            // 独立指定官方文件名，避免测试与生产实现共享错误的后缀拼接规则。
+            self.0.join(match variant {
+                WbVariant::Cn => "workbuddy-desktop.info.logged-out",
+                WbVariant::Ai => "workbuddy-desktop-ai.info.logged-out",
+            })
+        }
+    }
+
+    impl Drop for TempAuthDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn successful_auth_write_clears_only_target_logout_marker() {
+        for variant in [WbVariant::Cn, WbVariant::Ai] {
+            for token in [
+                json!("test-access-token"),
+                json!({"$wbEncrypted": 1, "envelope": {"v": 1, "wrapped": "test"}}),
+            ] {
+                let dir = TempAuthDir::new();
+                let path = dir.auth_path(variant);
+                let marker = dir.marker_path(variant);
+                let other_variant = match variant {
+                    WbVariant::Cn => WbVariant::Ai,
+                    WbVariant::Ai => WbVariant::Cn,
+                };
+                let other_path = dir.auth_path(other_variant);
+                let other_marker = dir.marker_path(other_variant);
+                std::fs::write(&marker, "logged-out").unwrap();
+                std::fs::write(&other_marker, "other-logout").unwrap();
+                std::fs::write(&other_path, "other-session").unwrap();
+                let account = json!({"uid": "target", "access_token": token});
+
+                write_account_to_auth_file_at(&account, &path).unwrap();
+
+                assert!(
+                    !marker.exists(),
+                    "WorkBuddy 会忽略带退出标记的认证文件，切换成功必须清理标记"
+                );
+                let written = read_auth_file_at(&path).unwrap();
+                assert_eq!(written["auth"]["accessToken"], token);
+                assert_eq!(written["account"]["uid"], "target");
+                assert_eq!(
+                    std::fs::read_to_string(other_marker).unwrap(),
+                    "other-logout"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(other_path).unwrap(),
+                    "other-session"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auth_write_without_logout_marker_remains_idempotent() {
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        let account = json!({"uid": "target", "access_token": "test-access-token"});
+
+        write_account_to_auth_file_at(&account, &path).unwrap();
+        write_account_to_auth_file_at(&account, &path).unwrap();
+
+        assert!(!dir.marker_path(WbVariant::Cn).exists());
+        let written = read_auth_file_at(&path).unwrap();
+        assert_eq!(written["auth"]["accessToken"], "test-access-token");
+        assert_eq!(written["allAccounts"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_auth_write_preserves_logout_marker() {
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        let marker = dir.marker_path(WbVariant::Cn);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), "existing-data").unwrap();
+        std::fs::write(&marker, "logged-out").unwrap();
+        let account = json!({"uid": "target", "access_token": "test-access-token"});
+
+        assert!(write_account_to_auth_file_at(&account, &path).is_err());
+
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "logged-out");
+        assert_eq!(
+            std::fs::read_to_string(path.join("keep")).unwrap(),
+            "existing-data"
+        );
+    }
+
+    #[test]
+    fn failed_logout_marker_removal_is_not_reported_as_success() {
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        let marker = dir.marker_path(WbVariant::Cn);
+        // 用同名非空目录模拟无法 remove_file 的标记，不依赖平台权限行为。
+        std::fs::create_dir(&marker).unwrap();
+        std::fs::write(marker.join("keep"), "existing-data").unwrap();
+        let account = json!({"uid": "target", "access_token": "test-access-token"});
+
+        let error = write_account_to_auth_file_at(&account, &path).unwrap_err();
+
+        assert!(
+            error.contains("退出标记"),
+            "错误应说明未清理退出标记：{error}"
+        );
+        assert!(marker.exists());
+        assert_eq!(
+            read_auth_file_at(&path).unwrap()["account"]["uid"],
+            "target"
+        );
+    }
 
     #[test]
     fn auth_file_path_is_expected_location() {

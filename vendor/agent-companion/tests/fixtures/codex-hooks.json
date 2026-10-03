@@ -136,24 +136,43 @@
     "hook": {
       "hook_event_name": "PreToolUse",
       "tool_name": "request_user_input_async",
-      "tool_use_id": "async"
+      "tool_use_id": "async",
+      "tool_input": {
+        "questions": [
+          {
+            "question": "Optional preference",
+            "options": [
+              {
+                "label": "A",
+                "description": "甲"
+              },
+              {
+                "label": "B"
+              }
+            ]
+          }
+        ]
+      }
     },
-    "status": "running",
-    "pending": 0
+    "status": "wait",
+    "pending": 1
   },
   {
     "hook": {
       "hook_event_name": "PostToolUse",
       "tool_name": "request_user_input_async",
-      "tool_use_id": "async"
+      "tool_use_id": "async",
+      "tool_response": {
+        "accepted": true
+      }
     },
-    "status": "running",
-    "pending": 0
+    "status": "wait",
+    "pending": 1
   },
   {
     "hook": {
       "hook_event_name": "UserPromptSubmit",
-      "prompt": "Answer"
+      "prompt": "<send_user_message_question_reply>\n[{\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"async\\\",0]\",\"answer\":\"A\"}]\n</send_user_message_question_reply>"
     },
     "status": "running",
     "pending": 0
@@ -162,19 +181,29 @@
     "hook": {
       "hook_event_name": "PreToolUse",
       "tool_name": "functions.request_user_input_async",
-      "tool_use_id": "functions.async"
+      "tool_use_id": "functions.async",
+      "tool_input": {
+        "questions": [
+          {
+            "title": "Optional follow-up"
+          }
+        ]
+      }
     },
-    "status": "running",
-    "pending": 0
+    "status": "wait",
+    "pending": 1
   },
   {
     "hook": {
       "hook_event_name": "PostToolUse",
       "tool_name": "functions.request_user_input_async",
-      "tool_use_id": "functions.async"
+      "tool_use_id": "functions.async",
+      "tool_response": {
+        "accepted": true
+      }
     },
-    "status": "running",
-    "pending": 0
+    "status": "wait",
+    "pending": 1
   },
   {
     "hook": {
@@ -182,8 +211,8 @@
       "tool_name": "functions.request_user_input_async",
       "tool_use_id": "functions.async"
     },
-    "status": "running",
-    "pending": 0
+    "status": "wait",
+    "pending": 1
   },
   {
     "hook": {
@@ -191,8 +220,8 @@
       "tool_name": "mcp__codex__request_user_input_async",
       "tool_use_id": "mcp__codex__async"
     },
-    "status": "running",
-    "pending": 0
+    "status": "wait",
+    "pending": 2
   },
   {
     "hook": {
@@ -200,14 +229,22 @@
       "tool_name": "mcp__codex__request_user_input_async",
       "tool_use_id": "mcp__codex__async"
     },
-    "status": "running",
-    "pending": 0
+    "status": "wait",
+    "pending": 2
   },
   {
     "hook": {
       "hook_event_name": "PreToolUse",
       "tool_name": "mcp__codex__request_user_input_async",
       "tool_use_id": "mcp__codex__async"
+    },
+    "status": "wait",
+    "pending": 2
+  },
+  {
+    "hook": {
+      "hook_event_name": "UserPromptSubmit",
+      "prompt": "Follow up"
     },
     "status": "running",
     "pending": 0
@@ -228,16 +265,19 @@
       "tool_use_id": "parallel-async"
     },
     "status": "wait",
-    "pending": 1
+    "pending": 2
   },
   {
     "hook": {
       "hook_event_name": "PostToolUse",
       "tool_name": "functions.request_user_input_async",
-      "tool_use_id": "parallel-async"
+      "tool_use_id": "parallel-async",
+      "tool_response": {
+        "accepted": true
+      }
     },
     "status": "wait",
-    "pending": 1
+    "pending": 2
   },
   {
     "hook": {
@@ -246,7 +286,7 @@
       "tool_use_id": "parallel-async"
     },
     "status": "wait",
-    "pending": 1
+    "pending": 2
   },
   {
     "hook": {
@@ -254,8 +294,8 @@
       "tool_name": "functions.request_user_input",
       "tool_use_id": "sync"
     },
-    "status": "running",
-    "pending": 0
+    "status": "wait",
+    "pending": 1
   },
   {
     "hook": {
@@ -264,7 +304,7 @@
       "tool_use_id": "cancel"
     },
     "status": "wait",
-    "pending": 1
+    "pending": 2
   },
   {
     "hook": {

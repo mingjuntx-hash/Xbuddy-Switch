@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { Link2, RotateCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,7 @@ import {
   type SessionLinksMeta,
 } from "@/components/session-link-shared";
 import * as api from "@/lib/api";
+import { displayName } from "@/lib/account-display";
 import { cn } from "@/lib/utils";
 import { accountVariant } from "@/lib/variant";
 import type {
@@ -28,7 +29,7 @@ export type { SessionLinksMeta };
 interface Props {
   /** 目标账号（来源账号身份由后端从该档位登录态读取，前端不传） */
   account: AccountMeta | null;
-  /** 弹窗是否打开：打开时拉取一次预览 */
+  /** 弹窗是否打开：打开时拉取预览，关闭时取消回写 */
   open: boolean;
   /** 切换进行中：禁止继续交互 */
   disabled?: boolean;
@@ -56,19 +57,20 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
   /** 手动重试计数：用于「重新检查」。 */
   const [reloadToken, setReloadToken] = useState(0);
 
-  useEffect(() => {
-    if (!open || !account) {
-      setPreview(null);
-      setError("");
-      setChecked(new Set());
-      setLoading(false);
-      return;
-    }
+  const accountId = account?.id;
+  const variant = accountVariant(account);
+
+  useLayoutEffect(() => {
+    // 退出动画期间保留内容；重新打开或更换目标时在绘制前清除旧预览。
+    if (!open || !accountId) return;
     let cancelled = false;
     setLoading(true);
     setError("");
+    setPreview(null);
+    setChecked(new Set());
+    onChange({ selections: [], groups: [] });
     api
-      .sessionLinksPreview(account.id, accountVariant(account))
+      .sessionLinksPreview(accountId, variant)
       .then((res) => {
         if (cancelled) return;
         setPreview(res);
@@ -93,12 +95,12 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
     };
     // 预览拉取只看「弹窗开关 / 目标账号 / 手动重试」；onChange 只做状态回写，
     // 不进依赖，否则父组件每次重渲染都会重新拉预览。
-  }, [open, account, reloadToken]);
+  }, [open, accountId, variant, reloadToken]);
 
   const groups = preview?.groups ?? [];
   // 国际版能力判定不通过：整块不可用（后端执行时仍会强制检查能力）。
   const unsupported = Boolean(preview && (!preview.supported || preview.storeStatus === "unsupported"));
-  const targetLabel = account?.nickname || account?.email || account?.uid || "目标账号";
+  const targetLabel = account ? displayName(account) : "目标账号";
 
   // 状态上报：父组件据此渲染 tab 徽标与常驻提示。
   useEffect(() => {

@@ -14,6 +14,7 @@ import {
   type SessionLinksMeta,
 } from "@/components/session-link-shared";
 import * as api from "@/lib/api";
+import { displayName } from "@/lib/account-display";
 import { cn } from "@/lib/utils";
 import type {
   AccountMeta,
@@ -111,7 +112,7 @@ export function VscodeSessionSyncSection({
   const groups = preview?.groups ?? [];
   // 插件侧没有档位能力探测，正常不会出现 supported=false；保留兜底以免渲染空 tab。
   const unsupported = Boolean(preview && (!preview.supported || preview.storeStatus === "unsupported"));
-  const targetLabel = account?.nickname || account?.email || account?.uid || "目标账号";
+  const targetLabel = account ? displayName(account) : "目标账号";
 
   // 状态上报：父组件据此渲染 tab 徽标。
   useEffect(() => {

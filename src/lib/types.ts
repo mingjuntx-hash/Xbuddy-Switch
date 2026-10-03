@@ -6,11 +6,23 @@
  */
 export type WbVariant = "cn" | "ai";
 
+/**
+ * 账号卡片显示名取哪个字段（每账号独立的本地偏好）。
+ * 缺省/异常按 `nickname` 处理；选定字段为空时回退 `nickname → uid`。
+ */
+export type DisplayField = "nickname" | "phone" | "note";
+
 export interface AccountMeta {
   id: string;
   uid: string | null;
   email: string | null;
   nickname: string | null;
+  /** 官方手机号（实时读 profile_raw，仅国内版账号可能有）。 */
+  phoneNumber?: string | null;
+  /** 本地备注（用户自填，不来自官方数据）。 */
+  note?: string | null;
+  /** 本地显示字段偏好。 */
+  displayField?: DisplayField | null;
   enterpriseName: string | null;
   expiresAt: number | null;
   refreshExpiresAt: number | null;
@@ -20,8 +32,6 @@ export interface AccountMeta {
   needsReloginReason: string | null;
   /** 账号所属档位；缺省（旧后端/历史账号）按国内版处理。 */
   variant?: WbVariant;
-  /** 用户自填备注（XBuddy 分支自有字段，用于分辨每个账号主要干嘛）。未填写为 null。 */
-  note?: string | null;
 }
 
 export interface AppStatus {
@@ -75,6 +85,8 @@ export interface ImportPreviewAccount {
   nickname: string | null;
   email: string | null;
   hasToken: boolean;
+  /** access_token 为 WorkBuddy 加密信封：可导入，但仅切换可用（签到/积分不可用）。 */
+  encrypted: boolean;
 }
 
 /** 导入结果计数。 */
@@ -135,6 +147,9 @@ export interface LinkedCopyResult {
 export interface SessionCopyReport {
   sourceUid?: string;
   targetUid?: string;
+  /** 跨档复制时带两侧档位；同档复制不出现这两个字段。 */
+  sourceVariant?: WbVariant;
+  targetVariant?: WbVariant;
   copied?: CopyResult[];
   alreadyLinked?: LinkedCopyResult[];
   errors?: { id: string; error: string }[];
@@ -166,7 +181,7 @@ export interface SessionRecoveryReport {
 export type SessionSyncVerdict = "identical" | "fastForward" | "ahead" | "diverge" | "unknown";
 
 /** 同步写入模式：只有后端 `availableModes` 里给出的模式才允许提交。 */
-export type SessionSyncMode = "fastForward" | "overwrite";
+export type SessionSyncMode = "fastForward" | "overwrite" | "unifyOverwrite";
 
 /** 关联组成员（不含正文）：`state` 为 active 时才算该账号的有效成员。 */
 export interface SessionLinkMember {
@@ -207,6 +222,9 @@ export interface SessionLinksPreview {
   storeError?: string;
   sourceUid: string;
   targetUid: string;
+  /** 跨档预览时带两侧档位；同档预览不出现这两个字段。 */
+  sourceVariant?: WbVariant;
+  targetVariant?: WbVariant;
   groups: SessionLinkPreviewGroup[];
 }
 
@@ -254,6 +272,121 @@ export interface SessionSyncReport {
   needsRecovery?: boolean;
   /** 临时备份残留（待清理/待恢复）；无异常时为空数组。 */
   temporaryFiles?: TemporaryFileInfo[];
+}
+
+// ---------------------------------------------------------------------------
+// Client-scoped session group directory
+// ---------------------------------------------------------------------------
+
+export type SessionGroupClient = "workbuddy" | "codebuddyIde" | "vscodeExt";
+export type SessionGroupStatus = "latest" | "behind" | "diverge" | "missing" | "unknown";
+export type SessionMemberVersionStatus = SessionGroupStatus | "stale" | "superseded";
+
+export interface SessionGroupSummary {
+  key: string;
+  client: SessionGroupClient;
+  variantScope: WbVariant | null;
+  groupId: string;
+  groupVariant: WbVariant;
+  title: string;
+  projectLabel: string;
+  latestActivityAt: number;
+  memberCount: number;
+  activeMemberCount: number;
+  accountNames: string[];
+  summaryStatus: SessionGroupStatus;
+  summaryText: string;
+  safeSourceMemberId: string | null;
+  hasSafeSource: boolean;
+}
+
+export interface SessionGroupMemberDetail {
+  memberId: string;
+  accountId: string | null;
+  uid: string;
+  sessionId: string;
+  accountName: string;
+  variant: WbVariant;
+  linkState: "active" | "stale" | "superseded";
+  versionStatus: SessionMemberVersionStatus;
+  title: string;
+  projectLabel: string;
+  updatedAt: number;
+  recordCount: number | null;
+  contentPreview?: { speaker: string; text: string }[];
+  contentState: "ready" | "missing" | "unavailable";
+  reason: string;
+  canBeSource: boolean;
+}
+
+export interface SessionGroupList {
+  client: SessionGroupClient;
+  variantScope: WbVariant | null;
+  storeStatus: "missing" | "ready" | "unavailable";
+  storeError?: string;
+  groups: SessionGroupSummary[];
+}
+
+export interface SessionGroupDetail extends SessionGroupSummary {
+  members: SessionGroupMemberDetail[];
+  addTargets: AccountMeta[];
+  divergence?: {
+    commonMemberIds: string[];
+    branches: string[][];
+  };
+}
+
+export interface SessionGroupPairPreview {
+  client: SessionGroupClient;
+  variantScope: WbVariant | null;
+  groupId: string;
+  sourceMemberId: string;
+  targetMemberId: string;
+  verdict: SessionSyncVerdict;
+  availableModes: SessionSyncMode[];
+  previewToken: string | null;
+  reason: string;
+  recordCount: { source: number; target: number; baseline: number | null } | null;
+  extraTargetCount: number;
+}
+
+/** One read-only plan for making every active copy match a chosen group member. */
+export interface SessionGroupUnifyPlan {
+  client: SessionGroupClient;
+  groupId: string;
+  sourceMemberId: string;
+  sourceName: string;
+  targets: {
+    memberId: string;
+    accountName: string;
+    preview: SessionGroupPairPreview | null;
+    error: string | null;
+  }[];
+}
+
+/** A client-reported current login, matched by stable UID or saved account ID. */
+export interface SessionGroupCurrentAccount {
+  variant?: WbVariant;
+  uid?: string | null;
+  accountId?: string | null;
+  running?: boolean;
+}
+
+export interface SessionGroupActionReport {
+  client: SessionGroupClient;
+  groupId: string;
+  sourceMemberId?: string;
+  targetMemberId?: string;
+  synced: SessionSyncResultItem[];
+  skipped: SessionSyncSkippedItem[];
+  errors: { groupId?: string; error: string }[];
+  needsRecovery?: boolean;
+  temporaryFiles?: TemporaryFileInfo[];
+  restartedVariants?: WbVariant[];
+  /** 插件侧：本次由 wb-switch 关闭并成功重开了 VS Code。 */
+  restartedEditor?: boolean;
+  /** 插件侧：写入已完成但 VS Code 未能自动重新打开（无 `errors` 数组的入口用它兜底）。 */
+  editorError?: string;
 }
 
 /**
@@ -769,7 +902,18 @@ export interface CodeBuddyCliStatus {
   helperSupportsAccountIds: boolean;
   helperCurrent?: boolean;
   migrationRequired?: boolean;
+  /**
+   * 需要用户介入的脱节：settings.json 里的 Token 已长期匹配不上账号库。
+   *
+   * 与 `syncInProgress` 互斥。保活刷新造成的短暂不一致不算脱节。
+   */
   syncPending?: boolean;
+  /**
+   * 保活刷新刚换完账号库的 Token、settings.json 尚未同步的正常中间态。
+   *
+   * 仅在账号库 mtime 落在同步宽限窗口内时为真；此时不该提示用户点「更新认证」。
+   */
+  syncInProgress?: boolean;
   activeIndex: number | null;
   activeAccountId: string | null;
   activeAccountName: string | null;
@@ -1050,4 +1194,3 @@ export interface VscodeSessionList {
    */
   dataRoot?: string | null;
 }
-

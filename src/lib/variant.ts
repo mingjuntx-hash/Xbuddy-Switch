@@ -56,3 +56,8 @@ export function variantSupportsCheckin(variant: WbVariant): boolean {
 export function variantUsesIntlCodebuddyIde(variant: WbVariant): boolean {
   return variant === "ai";
 }
+
+/** 是否为国际版（档位标记选国际版图标 + INTL 角标时用）。 */
+export function variantIsIntl(variant: WbVariant): boolean {
+  return variant === "ai";
+}

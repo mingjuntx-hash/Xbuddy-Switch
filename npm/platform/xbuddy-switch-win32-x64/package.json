@@ -1,6 +1,6 @@
 {
   "name": "xbuddy-switch-win32-x64",
-  "version": "0.1.53",
+  "version": "0.1.58",
   "description": "xbuddy-switch platform binary (win32-x64)",
   "os": [
     "win32"

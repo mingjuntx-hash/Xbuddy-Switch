@@ -11,6 +11,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
 import type { AccountMeta } from "@/lib/types";
 
@@ -20,11 +21,6 @@ interface Props {
   accounts: AccountMeta[];
   /** 导出完成后回调（参数为导出的账号数）。 */
   onExported?: (count: number) => void;
-}
-
-/** 账号展示名（与账号卡片一致）。 */
-function accountLabel(a: AccountMeta): string {
-  return a.nickname || a.email || a.uid || a.id;
 }
 
 /** 导出文件名：wb-switch-accounts-YYYY-MM-DD.json */
@@ -164,7 +160,7 @@ export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported 
                     checked={selected.has(a.id)}
                     onChange={() => toggle(a.id)}
                   />
-                  <span className="min-w-0 flex-1 truncate text-sm">{accountLabel(a)}</span>
+                  <span className="min-w-0 flex-1 truncate text-sm">{displayName(a)}</span>
                 </label>
               ))}
             </div>

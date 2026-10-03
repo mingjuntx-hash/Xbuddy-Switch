@@ -10,6 +10,8 @@
 //!   3) 云端映射：`~/.workbuddy/edge-sync-mapping-v{N}.db` edge_sync_mapping
 //!      （文件名版本号由客户端演进，按最大版本号动态发现）
 //!      （session_id=conversation_id，msg_channel=convmsg:{uid} 决定云端归属）
+//!      **不由本工具写入**：复制只写 1)、2)，映射行由 edge-sync 扩展在客户端下次
+//!      启动迁移副本时自行写入（预写会让客户端判定"已迁移"跳过上传，云端缺会话）。
 //!
 //! 复制收口（design §4）：所有复制入口统一走 [`copy_sessions_for_switch`]，在同一把
 //! 档位操作锁内先恢复未完成操作、再查询关联组；同一逻辑会话只保留一个有效副本，
@@ -34,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use crate::modules::account;
 use crate::modules::auth_file;
-use crate::modules::config::{now_ms, now_secs, store_dir};
+use crate::modules::config::{now_ms, store_dir};
 use crate::modules::process;
 use crate::modules::session_backup::{
     self, BackupLifecycle, CleanupOutcome, CLEANUP_STATE_SAFE_TERMINATED,
@@ -185,6 +187,17 @@ impl SessionPaths {
             .join(format!("session-ops-{}.lock", variant.as_str()))
     }
 
+    /// Long-running client-scoped session operation lock. IDE and VS Code stores are shared
+    /// across WorkBuddy variants, so their mutations must serialize across both variants.
+    pub fn client_ops_lock_file(&self) -> PathBuf {
+        let name = match self.link_namespace {
+            LinkNamespace::WorkBuddy => "workbuddy",
+            LinkNamespace::VscodeExt => "vscode-ext",
+            LinkNamespace::CodeBuddyIde => "codebuddy-ide",
+        };
+        self.locks_dir().join(format!("session-client-{name}.lock"))
+    }
+
     /// 关联存储的短时全局锁文件：与主表同生命周期，按命名空间分开。
     pub fn link_store_lock_file(&self) -> PathBuf {
         match self.link_namespace {
@@ -290,9 +303,31 @@ pub fn session_copy_supported_at(root: &Path) -> bool {
 /// 档位不支持会话复制时的统一错误文案。
 pub const SESSION_COPY_UNSUPPORTED: &str = "该档位暂不支持会话复制";
 
-/// WorkBuddy 正在运行时的统一错误文案：会话写入必须在 App 停止写入之后。
+/// 目标账号是当前登录账号、且 WorkBuddy 正在运行时的统一错误文案。
+///
+/// 写"非当前登录账号"的副本实测免关安全（`research/verification-app-running-write.md`
+/// 探针 5）：客户端不使用该账号的数据、切号后自然可见；写"当前登录账号"仍必须等
+/// App 停止写入——运行实例看不到写入，继续对话会让会话状态分叉。
 pub const SESSION_COPY_APP_RUNNING: &str =
-    "WorkBuddy 正在运行，已阻止修改会话数据；请先退出 WorkBuddy 后重试";
+    "目标账号正在 WorkBuddy 中使用，已阻止修改会话数据；请先退出 WorkBuddy 后重试";
+
+/// 目标档客户端运行时的写入门禁：仅当目标账号是该档位**当前登录账号**时拦截。
+///
+/// 无法读取登录态时保守拦截（宁可要求退出，不做无法判定的写入）。
+fn app_running_blocks_target_write(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    target_uid: &str,
+    is_app_running: &impl Fn(WbVariant) -> bool,
+) -> bool {
+    if !is_app_running(variant) {
+        return false;
+    }
+    match current_user_uid_at(&paths.auth_file) {
+        Some(current) => current == target_uid,
+        None => true,
+    }
+}
 
 /// 操作日志无法解析时的原因前缀（恢复与复制共用，避免漏报后写出第二个副本）。
 const UNPARSEABLE_OPERATION_REASON: &str = "操作记录无法解析";
@@ -371,6 +406,23 @@ pub fn list_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
     list_sessions_for_user_at(&SessionPaths::for_variant(variant), uid)
 }
 
+/// 指定账号名下的会话列表（会话管理页的源账号视角）。
+///
+/// 与 `GET /api/sessions` 的返回同形（`sessions / current / variant`），但来源是
+/// 显式账号而非登录态；账号缺 uid 时返回空列表 + `current: null`（与现有容错一致）。
+pub fn list_sessions_for_account(account: &Value) -> Value {
+    let variant = account::variant_of(account);
+    let uid = account_uid(account);
+    if uid.is_empty() {
+        return json!({ "sessions": [], "current": Value::Null, "variant": variant.as_str() });
+    }
+    json!({
+        "sessions": list_sessions_for_user(variant, &uid),
+        "current": uid,
+        "variant": variant.as_str(),
+    })
+}
+
 fn list_sessions_for_user_at(paths: &SessionPaths, uid: &str) -> Value {
     let db = paths.workbuddy_db();
     if !db.is_file() {
@@ -440,7 +492,7 @@ fn list_sessions_for_user_at(paths: &SessionPaths, uid: &str) -> Value {
 }
 
 /// 在 `{档位数据根}/projects/{workspace}/{cid}.jsonl` 定位会话正文。
-fn find_project_jsonl(paths: &SessionPaths, cid: &str) -> Option<PathBuf> {
+pub(crate) fn find_project_jsonl(paths: &SessionPaths, cid: &str) -> Option<PathBuf> {
     let projects = paths.projects_dir();
     if !projects.is_dir() {
         return None;
@@ -513,19 +565,41 @@ fn session_row_owner(paths: &SessionPaths, cid: &str) -> Option<String> {
 
 /// 在 workbuddy.db 中把源会话行复制为新 id（动态列，覆盖 id/user_id/时间戳）。
 ///
+/// 跨档时源行与目标行分属两个库：源行从 `source_paths` 读取（跨档用只读连接），
+/// 目标行按**目标表列序取交集**写入——目标存在而源没有的列不写，由库默认值补齐，
+/// 不写 NULL 破坏约束（design §2.3；旧版客户端列少时靠这条兼容）。
 /// 与旧实现不同：db/表/源行缺失都显式返回，不再静默 Ok。
 fn insert_session_copy(
-    paths: &SessionPaths,
+    source_paths: &SessionPaths,
+    target_paths: &SessionPaths,
     new_cid: &str,
     cid: &str,
     source_uid: &str,
     target_uid: &str,
 ) -> Result<DbCopyOutcome, String> {
-    let db_path = paths.workbuddy_db();
-    if !db_path.is_file() {
+    let dst_db = target_paths.workbuddy_db();
+    if !dst_db.is_file() {
         return Ok(DbCopyOutcome::NoDb);
     }
-    let Some(conn) = open_db(&db_path, false) else {
+    let src_db = source_paths.workbuddy_db();
+    let same_db = src_db == dst_db;
+    let source_row = if src_db.is_file() {
+        // 同档沿用读写连接（与改造前一致）；跨档对源档只读，不触碰源档 WAL 恢复。
+        let Some(conn) = open_db(&src_db, !same_db) else {
+            return Err("会话数据无法打开".to_string());
+        };
+        if !table_exists(&conn, "sessions") {
+            return Ok(DbCopyOutcome::NoSessionsTable);
+        }
+        read_source_session_row(&conn, cid, source_uid)?
+    } else {
+        None
+    };
+    let Some(source_row) = source_row else {
+        return Ok(DbCopyOutcome::SourceRowMissing);
+    };
+
+    let Some(conn) = open_db(&dst_db, false) else {
         return Err("会话数据无法打开".to_string());
     };
     if !table_exists(&conn, "sessions") {
@@ -533,42 +607,32 @@ fn insert_session_copy(
     }
     // 写事务的提交必须可靠持久：在本次实际写连接上确认 synchronous ≥ FULL。
     session_backup::ensure_full_synchronous(&conn)?;
-    let mut src_stmt = conn
-        .prepare("SELECT * FROM sessions WHERE id = ?1 AND user_id = ?2")
-        .map_err(|e| e.to_string())?;
-    let cols: Vec<String> = src_stmt
-        .column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let mut rows = src_stmt
-        .query(rusqlite::params![cid, source_uid])
-        .map_err(|e| e.to_string())?;
-    let Some(row) = rows.next().map_err(|e| e.to_string())? else {
-        return Ok(DbCopyOutcome::SourceRowMissing);
-    };
-    let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(cols.len());
-    for (i, col) in cols.iter().enumerate() {
-        let v = row
-            .get::<_, rusqlite::types::Value>(i)
-            .unwrap_or(rusqlite::types::Value::Null);
+    let target_cols = session_table_columns(&conn)?;
+
+    let mut cols: Vec<String> = Vec::with_capacity(target_cols.len());
+    let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(target_cols.len());
+    for col in &target_cols {
+        let Some((_, value)) = source_row.iter().find(|(name, _)| name == col) else {
+            continue;
+        };
+        let value = value.clone();
         if col == "cwd" {
-            if let rusqlite::types::Value::Text(ref path) = v {
+            if let rusqlite::types::Value::Text(ref path) = value {
                 if is_claw_workspace(path) {
                     return Err("Claw 工作区绑定当前账号渠道，不支持复制".to_string());
                 }
             }
         }
-        match col.as_str() {
-            "id" => vals.push(rusqlite::types::Value::Text(new_cid.to_string())),
-            "user_id" => vals.push(rusqlite::types::Value::Text(target_uid.to_string())),
-            "created_at" | "updated_at" => vals.push(rusqlite::types::Value::Integer(now_ms())),
-            "deleted_at" => vals.push(rusqlite::types::Value::Null),
-            _ => vals.push(v),
-        }
+        let value = match col.as_str() {
+            "id" => rusqlite::types::Value::Text(new_cid.to_string()),
+            "user_id" => rusqlite::types::Value::Text(target_uid.to_string()),
+            "created_at" | "updated_at" => rusqlite::types::Value::Integer(now_ms()),
+            "deleted_at" => rusqlite::types::Value::Null,
+            _ => value,
+        };
+        cols.push(col.clone());
+        vals.push(value);
     }
-    drop(rows);
-    drop(src_stmt);
 
     let placeholders = cols.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
     let colnames = cols.join(", ");
@@ -578,6 +642,43 @@ fn insert_session_copy(
     conn.execute(&sql, rusqlite::params_from_iter(params))
         .map_err(|e| format!("会话记录保存失败：{e}"))?;
     Ok(DbCopyOutcome::Inserted)
+}
+
+/// 读取一行会话（列名 + 值，按源表列序），供跨库复制按目标列取交集。
+fn read_source_session_row(
+    conn: &Connection,
+    cid: &str,
+    uid: &str,
+) -> Result<Option<Vec<(String, rusqlite::types::Value)>>, String> {
+    let mut stmt = conn
+        .prepare("SELECT * FROM sessions WHERE id = ?1 AND user_id = ?2")
+        .map_err(|e| e.to_string())?;
+    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let mut rows = stmt
+        .query(rusqlite::params![cid, uid])
+        .map_err(|e| e.to_string())?;
+    let Some(row) = rows.next().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let values = cols
+        .into_iter()
+        .enumerate()
+        .map(|(i, col)| {
+            let value = row
+                .get::<_, rusqlite::types::Value>(i)
+                .unwrap_or(rusqlite::types::Value::Null);
+            (col, value)
+        })
+        .collect();
+    Ok(Some(values))
+}
+
+/// 目标 sessions 表的列名（按表自身列序）。
+fn session_table_columns(conn: &Connection) -> Result<Vec<String>, String> {
+    let stmt = conn
+        .prepare("SELECT * FROM sessions LIMIT 0")
+        .map_err(|e| e.to_string())?;
+    Ok(stmt.column_names().iter().map(|s| s.to_string()).collect())
 }
 
 /// 写后校验：目标行必须存在、归属目标账号且未删除。
@@ -592,81 +693,6 @@ fn verify_session_row(paths: &SessionPaths, new_cid: &str, target_uid: &str) -> 
 }
 
 /// 云端映射登记结果：失败必须上报，不能静默降级成成功。
-#[derive(Debug, Clone)]
-enum MappingOutcome {
-    Registered,
-    Unavailable(String),
-}
-
-/// 把新会话注册进 edge_sync_mapping（云端归属关键）。沿用既有登记方式，不扩大作用。
-fn register_edge_sync_mapping(
-    paths: &SessionPaths,
-    variant: WbVariant,
-    new_cid: &str,
-    target_uid: &str,
-) -> MappingOutcome {
-    let db_path = paths.edge_sync_db(variant);
-    if !db_path.is_file() {
-        return MappingOutcome::Unavailable(format!(
-            "云端映射库 {} 不存在",
-            db_path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_default()
-        ));
-    }
-    let Some(conn) = open_db(&db_path, false) else {
-        return MappingOutcome::Unavailable("云端映射库无法打开".to_string());
-    };
-    if !table_exists(&conn, "edge_sync_mapping") {
-        return MappingOutcome::Unavailable("云端映射库缺少 edge_sync_mapping 表".to_string());
-    }
-    if let Err(reason) = session_backup::ensure_full_synchronous(&conn) {
-        return MappingOutcome::Unavailable(reason);
-    }
-    let result = conn.execute(
-        "INSERT OR REPLACE INTO edge_sync_mapping \
-         (session_id, conversation_id, msg_channel, created_at) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![
-            new_cid,
-            new_cid,
-            format!("convmsg:{target_uid}"),
-            now_secs()
-        ],
-    );
-    match result {
-        Ok(_) => MappingOutcome::Registered,
-        Err(error) => MappingOutcome::Unavailable(format!("云端映射登记失败：{error}")),
-    }
-}
-
-/// 目标会话是否已按预期登记在云端映射表（恢复跳过重放时只核验，不 INSERT）。
-fn mapping_row_matches(
-    paths: &SessionPaths,
-    variant: WbVariant,
-    session_id: &str,
-    target_uid: &str,
-) -> bool {
-    let db_path = paths.edge_sync_db(variant);
-    if !db_path.is_file() {
-        return false;
-    }
-    let Some(conn) = open_db(&db_path, true) else {
-        return false;
-    };
-    if !table_exists(&conn, "edge_sync_mapping") {
-        return false;
-    }
-    let expected = format!("convmsg:{target_uid}");
-    conn.query_row(
-        "SELECT msg_channel FROM edge_sync_mapping WHERE session_id = ?1",
-        [session_id],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .is_some_and(|channel| channel == expected)
-}
-
 /// 把勾选的会话复制到目标账号（路径 B）。返回复制报告。
 ///
 /// 档位以**目标账号**自身为准：数据根、数据库、备份目录、认证文件都取该档位。
@@ -687,7 +713,89 @@ pub fn copy_sessions_for_switch(
     )
 }
 
-/// 可注入路径与「App 是否运行」探针的复制入口（单测注入临时目录与假探针，不触碰
+/// 把勾选的会话从**显式源账号**复制到**显式目标账号**（跨档复制入口，design §2.1）。
+///
+/// 与 [`copy_sessions_for_switch`] 的差异只在来源判定：源 uid 取自 `source_acc`，
+/// 不再从目标档登录态读取；源档与目标档可为不同档位。写入侧仍以目标账号为准
+/// （数据根、数据库、映射库、备份目录），源档只读。
+pub fn copy_sessions_cross(
+    source_acc: &Value,
+    target_acc: &Value,
+    session_ids: &[String],
+) -> Result<Value, String> {
+    let source_variant = account::variant_of(source_acc);
+    let target_variant = account::variant_of(target_acc);
+    let source_paths = SessionPaths::for_variant(source_variant);
+    let target_paths = SessionPaths::for_variant(target_variant);
+    let source_uid = account_uid(source_acc);
+    if source_uid.is_empty() {
+        return Err("源账号缺少 uid，无法复制会话".to_string());
+    }
+    let target_uid = account_uid(target_acc);
+    if target_uid.is_empty() {
+        return Err("目标账号缺少 uid，无法复制会话".to_string());
+    }
+    let source = CopySide {
+        paths: &source_paths,
+        variant: source_variant,
+        uid: source_uid,
+        account_id: nonempty_text(
+            source_acc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        ),
+    };
+    let target = CopySide {
+        paths: &target_paths,
+        variant: target_variant,
+        uid: target_uid,
+        account_id: nonempty_text(
+            target_acc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        ),
+    };
+    copy_sessions_cross_at(
+        source,
+        target,
+        session_ids,
+        process::is_workbuddy_running,
+        SessionPaths::for_variant,
+    )
+}
+
+/// 可注入路径与「App 是否运行」探针的跨档复制入口（单测注入临时双档目录与假探针，
+/// 不触碰真实路径、不探测真实进程）。
+fn copy_sessions_cross_at(
+    source: CopySide<'_>,
+    target: CopySide<'_>,
+    session_ids: &[String],
+    is_app_running: impl Fn(WbVariant) -> bool,
+    resolve_source_paths: impl Fn(WbVariant) -> SessionPaths,
+) -> Result<Value, String> {
+    // 快拒只针对**目标档**（写侧）：源档只读，运行中的源客户端不影响读取安全；
+    // 目标账号不是当前登录账号时免关直接写（实测，见门禁函数注释）。
+    if app_running_blocks_target_write(target.paths, target.variant, &target.uid, &is_app_running) {
+        return Err(SESSION_COPY_APP_RUNNING.to_string());
+    }
+    // 源档也要读（正文与源行），国际版数据根不同构时同样不支持（design D6）。
+    ensure_session_copy_supported(source.paths, source.variant)?;
+    ensure_session_copy_supported(target.paths, target.variant)?;
+    if source.variant == target.variant && source.uid == target.uid {
+        return Err("源账号与目标账号相同，无需复制会话".to_string());
+    }
+    run_copy(
+        &source,
+        &target,
+        session_ids,
+        is_app_running,
+        resolve_source_paths,
+    )
+}
+
+/// 可注入路径与「App 是否运行」探针的同档复制入口（单测注入临时目录与假探针，不触碰
 /// 真实路径、不探测真实进程）。
 ///
 /// App 运行检查做两次：拿档位操作锁之前先快速拒绝；拿锁之后再复查——锁前到拿锁之间
@@ -699,17 +807,9 @@ fn copy_sessions_for_switch_at(
     session_ids: &[String],
     is_app_running: impl Fn(WbVariant) -> bool,
 ) -> Result<Value, String> {
-    if is_app_running(variant) {
-        return Err(SESSION_COPY_APP_RUNNING.to_string());
-    }
     // 探测只对国际版生效（design D6 针对的是国际版数据根不同构）。国内版数据根与
     // 改造前同构，保留改造前的路径与返回结构，不让国内版看到「暂不支持」类新文案。
-    if variant == WbVariant::Ai && !session_copy_supported_at(&paths.data_root) {
-        return Err(format!(
-            "{SESSION_COPY_UNSUPPORTED}（档位 {}）",
-            variant.as_str()
-        ));
-    }
+    ensure_session_copy_supported(paths, variant)?;
     let target_uid = account_uid(target_acc);
     if target_uid.is_empty() {
         return Err("目标账号缺少 uid，无法复制会话".to_string());
@@ -719,29 +819,107 @@ fn copy_sessions_for_switch_at(
     if source_uid == target_uid {
         return Err("当前账号与目标账号相同，无需复制会话".to_string());
     }
-
-    // 档位操作锁覆盖「恢复 → 查询关联 → 写副本 → 提交关联」全过程，
-    // 并发请求与中断重试因此不会各自写出第二个副本。
-    let _ops_lock = session_link::try_acquire_variant_ops_lock(paths, variant)?;
-    // 复查：锁前未运行、拿锁后 App 已被启动的情况在这里被拦住，不写入任何产物。
-    if is_app_running(variant) {
+    // 同档路径的源恒为当前登录账号、且上面已拦同账号，因此这里对"目标=当前登录"
+    // 恒为放行；保留统一门禁只为与其他写入入口共用同一条规则。
+    if app_running_blocks_target_write(paths, variant, &target_uid, &is_app_running) {
         return Err(SESSION_COPY_APP_RUNNING.to_string());
     }
-    let recovery = recover_pending_session_operations_at(paths, variant);
-    let pending = session_link::pending_operations(paths, variant);
-
-    let context = CopyContext {
+    let source = CopySide {
         paths,
         variant,
-        source_uid: &source_uid,
-        source_account_id: account_id_for_uid(paths, &source_uid),
-        target_uid: &target_uid,
-        target_account_id: nonempty_text(
+        account_id: account_id_for_uid(paths, &source_uid),
+        uid: source_uid,
+    };
+    let target = CopySide {
+        paths,
+        variant,
+        account_id: nonempty_text(
             target_acc
                 .get("id")
                 .and_then(|v| v.as_str())
                 .map(String::from),
         ),
+        uid: target_uid,
+    };
+    run_copy(
+        &source,
+        &target,
+        session_ids,
+        is_app_running,
+        SessionPaths::for_variant,
+    )
+}
+
+/// 国际版支持性探测的统一封装：只有国际版需要数据根同构检查（design D6）。
+fn ensure_session_copy_supported(paths: &SessionPaths, variant: WbVariant) -> Result<(), String> {
+    if variant == WbVariant::Ai && !session_copy_supported_at(&paths.data_root) {
+        return Err(format!(
+            "{SESSION_COPY_UNSUPPORTED}（档位 {}）",
+            variant.as_str()
+        ));
+    }
+    Ok(())
+}
+
+/// 复制的一方：档位数据根、档位名与账号身份（源侧只读、目标侧写入）。
+struct CopySide<'a> {
+    paths: &'a SessionPaths,
+    variant: WbVariant,
+    uid: String,
+    /// 账号库中的账号 id（仅作展示，身份判定以 uid 为准）。
+    account_id: Option<String>,
+}
+
+/// 同档与跨档复制的统一流程：双档锁 → 恢复 → 逐会话复制 → 报告。
+///
+/// `resolve_source_paths` 用于恢复未完成的**跨档**操作时解析其源档数据根；
+/// 同档入口传 [`SessionPaths::for_variant`]，跨档入口可注入与两条 side 一致的映射，
+/// 单测由此避免触碰真实目录。
+fn run_copy(
+    source: &CopySide<'_>,
+    target: &CopySide<'_>,
+    session_ids: &[String],
+    is_app_running: impl Fn(WbVariant) -> bool,
+    resolve_source_paths: impl Fn(WbVariant) -> SessionPaths,
+) -> Result<Value, String> {
+    // 档位操作锁覆盖「恢复 → 查询关联 → 写副本 → 提交关联」全过程，
+    // 并发请求与中断重试因此不会各自写出第二个副本。
+    // 跨档操作同时持有两档锁，获取顺序固定为枚举序（Cn → Ai），任何代码路径不得
+    // 反序，避免两个方向的跨档操作互相等待（design §2.5）。
+    let mut _ops_locks = Vec::new();
+    for variant in WbVariant::ALL {
+        if variant == source.variant {
+            _ops_locks.push(session_link::try_acquire_variant_ops_lock(
+                source.paths,
+                variant,
+            )?);
+        } else if variant == target.variant {
+            _ops_locks.push(session_link::try_acquire_variant_ops_lock(
+                target.paths,
+                variant,
+            )?);
+        }
+    }
+    // 复查：锁前未运行、拿锁后目标账号被登录进 App 的情况在这里被拦住，不写入任何产物。
+    if app_running_blocks_target_write(target.paths, target.variant, &target.uid, &is_app_running) {
+        return Err(SESSION_COPY_APP_RUNNING.to_string());
+    }
+    let recovery = recover_pending_session_operations_at_with(
+        target.paths,
+        target.variant,
+        resolve_source_paths,
+    );
+    let pending = session_link::pending_operations(target.paths, target.variant);
+
+    let context = CopyContext {
+        paths: target.paths,
+        variant: target.variant,
+        source_paths: source.paths,
+        source_variant: source.variant,
+        source_uid: &source.uid,
+        source_account_id: source.account_id.clone(),
+        target_uid: &target.uid,
+        target_account_id: target.account_id.clone(),
         pending: &pending,
     };
 
@@ -794,14 +972,19 @@ fn copy_sessions_for_switch_at(
     }
 
     // 本次请求之后仍存在未完成操作（含本次刚留下的）→ 必须提示恢复需求。
-    let unfinished_after = session_link::pending_operations(paths, variant);
+    let unfinished_after = session_link::pending_operations(target.paths, target.variant);
     let unusable = !recovery.is_clean() || !unfinished_after.is_empty();
     let mut report = json!({
-        "sourceUid": source_uid,
-        "targetUid": target_uid,
+        "sourceUid": &source.uid,
+        "targetUid": &target.uid,
         "copied": copied,
         "alreadyLinked": already_linked,
     });
+    // 跨档复制在报告里带两侧档位；同档报告保持原字段（逐字不变）。
+    if source.variant != target.variant {
+        report["sourceVariant"] = json!(source.variant.as_str());
+        report["targetVariant"] = json!(target.variant.as_str());
+    }
     if !errors.is_empty() {
         report["errors"] = json!(errors);
     }
@@ -811,7 +994,7 @@ fn copy_sessions_for_switch_at(
     // 本轮复制之后再扫一遍：当前项的清理失败/保护残留必须出现在报告里，
     // 不能只用请求开始时的维护快照（否则成功项 pending 只在 copied[] 上）。
     // 维护可能补清成功：成功项上的 pending 路径必须改写成 null，避免虚假可还原位置。
-    report["temporaryFiles"] = json!(session_backup::maintain(paths, variant));
+    report["temporaryFiles"] = json!(session_backup::maintain(target.paths, target.variant));
     if let Some(items) = report.get_mut("copied").and_then(Value::as_array_mut) {
         reconcile_reported_cleanup(items);
     }
@@ -819,9 +1002,14 @@ fn copy_sessions_for_switch_at(
 }
 
 /// 复制上下文中不变的输入（避免逐会话重复解析）。
+///
+/// 源 / 目标解耦：`paths` 恒为目标档（写侧），`source_paths` 恒为源档（读侧）；
+/// 同档复制时两者相同，跨档复制时指向不同数据根。
 struct CopyContext<'a> {
     paths: &'a SessionPaths,
     variant: WbVariant,
+    source_paths: &'a SessionPaths,
+    source_variant: WbVariant,
     source_uid: &'a str,
     source_account_id: Option<String>,
     target_uid: &'a str,
@@ -877,9 +1065,13 @@ fn resolve_target(context: &CopyContext, cid: &str) -> Result<TargetResolution, 
             return Err(format!("{reason}；已阻止复制"));
         }
     };
-    let Some(group) =
-        session_link::find_group_for_identity(&store, context.variant, context.source_uid, cid)
-    else {
+    // 身份查找按**源档**（跨档组的源成员记源档位，组级 variant 不参与判定）。
+    let Some(group) = session_link::find_group_for_identity(
+        &store,
+        context.source_variant,
+        context.source_uid,
+        cid,
+    ) else {
         return Ok(TargetResolution {
             group_id: None,
             existing_link: None,
@@ -905,16 +1097,45 @@ fn resolve_target(context: &CopyContext, cid: &str) -> Result<TargetResolution, 
     })
 }
 
+/// 目标正文路径：目标档 `projects` 下沿用源文件所在的工作区子目录。
+///
+/// 客户端按会话行的 `cwd` 推导工作区目录名（跨档实验已验证：同名目录下客户端可读），
+/// 而 `cwd` 在复制时原样保留，所以跨档时目录名也必须保持一致（design §2.2）。
+/// 同档时 `source_paths == target_paths`，结果与源文件同目录，与改造前逐字相同。
+fn target_body_path(
+    source_path: &Path,
+    source_paths: &SessionPaths,
+    target_paths: &SessionPaths,
+    new_cid: &str,
+) -> PathBuf {
+    let file_name = format!("{new_cid}.jsonl");
+    let relative = source_path
+        .parent()
+        .and_then(|parent| parent.strip_prefix(source_paths.projects_dir()).ok())
+        .filter(|relative| !relative.as_os_str().is_empty());
+    match relative {
+        Some(relative) => target_paths.projects_dir().join(relative).join(file_name),
+        None => target_paths.projects_dir().join(file_name),
+    }
+}
+
 /// 写入副本正文并做写后校验（复用同一次源快照，避免 TOCTOU）。
 fn write_copy_body(
     snapshot: &ContentSnapshot,
     source_path: &Path,
+    source_paths: &SessionPaths,
+    target_paths: &SessionPaths,
     cid: &str,
     new_cid: &str,
 ) -> Result<PathBuf, String> {
-    let dest = source_path.with_file_name(format!("{new_cid}.jsonl"));
+    let dest = target_body_path(source_path, source_paths, target_paths, new_cid);
     if dest.exists() {
         return Err("目标内容已存在同名文件，已停止复制".to_string());
+    }
+    // 跨档时目标档可能没有该工作区目录（源目录名跨档一致，见 `target_body_path`）。
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("目标工作区目录创建失败：{error}"))?;
     }
     let text = snapshot.text.replace(cid, new_cid);
     // 正文属于业务完成门禁：会话专用持久化写（sync_all + 父目录持久化）。
@@ -968,7 +1189,8 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         ));
     }
 
-    let Some(source_path) = find_project_jsonl(paths, cid) else {
+    // 源正文与源行都在源档（跨档时与目标档不同）。
+    let Some(source_path) = find_project_jsonl(context.source_paths, cid) else {
         return Err("会话内容不存在，未复制".to_string());
     };
     let snapshot = match session_link::read_content_snapshot(&source_path, cid) {
@@ -978,7 +1200,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
             return Err(format!("会话内容无法验证（{reason}），未复制"));
         }
     };
-    let source_owner = session_row_owner(paths, cid);
+    let source_owner = session_row_owner(context.source_paths, cid);
     match source_owner.as_deref() {
         Some(owner) if owner == context.source_uid => {}
         Some(_) => return Err("源会话不属于当前账号，未复制".to_string()),
@@ -1026,6 +1248,9 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         operation_id: lifecycle.operation_id.clone(),
         kind: OPERATION_KIND_COPY.to_string(),
         variant: context.variant,
+        // 同档复制写 None（与旧记录逐字兼容）；跨档复制显式记录源档，恢复时据此读源。
+        source_variant: (context.source_variant != context.variant)
+            .then_some(context.source_variant),
         group_id: group_id.clone(),
         source: OperationMember {
             account_id: context.source_account_id.clone(),
@@ -1052,6 +1277,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
     if let Err(error) = finish_copy_from_body(
         paths,
         context.variant,
+        context.source_paths,
         &mut operation,
         &snapshot,
         Some(&source_path),
@@ -1140,10 +1366,12 @@ fn report_cleanup(
 /// 从「源快照已确认」开始推进复制：写正文 → 写数据库行 → 登记映射 → 提交关联与基线。
 ///
 /// `body_source` 为 `Some(source_path)` 时先写正文；为 `None` 表示正文此前已写成
-/// （恢复场景），直接继续数据库行与关联。
+/// （恢复场景），直接继续数据库行与关联。源行读取与目标行写入的档位经
+/// `source_paths` 分离（跨档复制时与 `paths` 不同，同档时相同）。
 fn finish_copy_from_body(
     paths: &SessionPaths,
     variant: WbVariant,
+    source_paths: &SessionPaths,
     operation: &mut Operation,
     snapshot: &ContentSnapshot,
     body_source: Option<&Path>,
@@ -1152,6 +1380,8 @@ fn finish_copy_from_body(
         write_copy_body(
             snapshot,
             source_path,
+            source_paths,
+            paths,
             &operation.source.session_id,
             &operation.target.session_id,
         )?;
@@ -1159,6 +1389,7 @@ fn finish_copy_from_body(
     }
 
     match insert_session_copy(
+        source_paths,
         paths,
         &operation.target.session_id,
         &operation.source.session_id,
@@ -1175,15 +1406,9 @@ fn finish_copy_from_body(
     verify_session_row(paths, &operation.target.session_id, &operation.target.uid)?;
     advance_operation(paths, operation, OpPhase::DbWritten)?;
 
-    match register_edge_sync_mapping(
-        paths,
-        variant,
-        &operation.target.session_id,
-        &operation.target.uid,
-    ) {
-        MappingOutcome::Registered => {}
-        MappingOutcome::Unavailable(reason) => return Err(reason),
-    }
+    // 云端登记交接给客户端：不预写 edge_sync_mapping——预写会让 edge-sync 扩展
+    // 判定"已迁移"而跳过上传，导致云端没有会话、后续 RENAME/ACTIVITY 404。
+    // 副本由客户端下次启动时自行迁移并写入映射行；阶段标记保留，语义为"已交接"。
     advance_operation(paths, operation, OpPhase::MappingWritten)?;
 
     let group_id = commit_links(paths, variant, operation, &snapshot.normalized)?;
@@ -1231,6 +1456,8 @@ fn commit_links(
 ) -> Result<String, String> {
     let source = &operation.source;
     let target = &operation.target;
+    // 成员级档位：源成员记源档（跨档组的身份基础），目标成员记目标档（参数 variant）。
+    let source_variant = operation.source_variant.unwrap_or(variant);
     let group_id = operation.group_id.clone();
     let group_id_out = group_id.clone();
     session_link::with_link_store_write(paths, move |store| {
@@ -1261,6 +1488,7 @@ fn commit_links(
                             account_id: source.account_id.clone(),
                             uid: source.uid.clone(),
                             session_id: source.session_id.clone(),
+                            variant: Some(source_variant),
                             state: MemberState::Active,
                             linked_at: now_ms(),
                             last_synced_at: None,
@@ -1287,6 +1515,7 @@ fn commit_links(
                             account_id: target.account_id.clone(),
                             uid: target.uid.clone(),
                             session_id: target.session_id.clone(),
+                            variant: Some(variant),
                             state: MemberState::Active,
                             linked_at: now_ms(),
                             last_synced_at: None,
@@ -1444,7 +1673,7 @@ pub fn parse_sync_selections(value: Option<&Value>) -> Result<Vec<SyncSelection>
 }
 
 /// 成员当前正文状态；`projects/` 下找不到正文一律按 Missing（不当作空正文）。
-fn member_content_state(paths: &SessionPaths, session_id: &str) -> ContentState {
+pub(crate) fn member_content_state(paths: &SessionPaths, session_id: &str) -> ContentState {
     match find_project_jsonl(paths, session_id) {
         Some(path) => session_link::read_content_snapshot(&path, session_id),
         None => ContentState::Missing,
@@ -1611,7 +1840,116 @@ fn session_links_preview_at(
                         && has_member_for(group, &source_uid)
                         && has_member_for(group, &target_uid)
                 })
-                .map(|group| preview_group_item(paths, group, &source_uid, &target_uid))
+                .map(|group| {
+                    let fixed_paths = |_: &LinkGroup, _: &LinkMember| paths.clone();
+                    preview_group_item(paths, &fixed_paths, group, &source_uid, &target_uid)
+                })
+                .collect();
+            report["groups"] = json!(groups);
+        }
+    }
+    Ok(report)
+}
+
+/// 预览「显式来源账号 → 显式目标账号」可同步的关联组（会话管理页用；跨档支持）。
+///
+/// 与 [`session_links_preview`] 的差异只在来源判定：源 uid 取自 `source_acc`，
+/// 不再从登录态读取；成员内容与行按**成员自身档位**读取（跨档组：源读源档、
+/// 目标读目标档），关联存储与基线共享。
+pub fn session_links_preview_cross(
+    source_acc: &Value,
+    target_acc: &Value,
+) -> Result<Value, String> {
+    let source_variant = account::variant_of(source_acc);
+    let target_variant = account::variant_of(target_acc);
+    session_links_preview_cross_at(
+        &SessionPaths::for_variant(source_variant),
+        source_variant,
+        source_acc,
+        &SessionPaths::for_variant(target_variant),
+        target_variant,
+        target_acc,
+        SessionPaths::for_variant,
+    )
+}
+
+/// [`session_links_preview_cross`] 的可注入版本（单测注入临时双档目录与解析器）。
+fn session_links_preview_cross_at(
+    source_paths: &SessionPaths,
+    source_variant: WbVariant,
+    source_acc: &Value,
+    target_paths: &SessionPaths,
+    target_variant: WbVariant,
+    target_acc: &Value,
+    resolve_source_paths: impl Fn(WbVariant) -> SessionPaths,
+) -> Result<Value, String> {
+    let source_uid = account_uid(source_acc);
+    if source_uid.is_empty() {
+        return Err("来源账号缺少 uid，无法预览会话".to_string());
+    }
+    let target_uid = account_uid(target_acc);
+    if target_uid.is_empty() {
+        return Err("目标账号缺少 uid，无法同步会话".to_string());
+    }
+    if source_variant == target_variant && source_uid == target_uid {
+        return Err("来源账号与目标账号相同，无需同步会话".to_string());
+    }
+    // 能力探测与复制同口径：成员数据根只有国际版需要同构检查（读也依赖）。
+    let mut supported = true;
+    for (paths, variant) in [
+        (source_paths, source_variant),
+        (target_paths, target_variant),
+    ] {
+        if variant == WbVariant::Ai && !session_copy_supported_at(&paths.data_root) {
+            supported = false;
+        }
+    }
+
+    let mut report = json!({
+        "supported": supported,
+        "sourceUid": source_uid,
+        "targetUid": target_uid,
+        "groups": [],
+    });
+    // 跨档预览在报告里带两侧档位；同档报告保持原字段（与现有入口逐字兼容）。
+    if source_variant != target_variant {
+        report["sourceVariant"] = json!(source_variant.as_str());
+        report["targetVariant"] = json!(target_variant.as_str());
+    }
+    if !supported {
+        report["storeStatus"] = json!("unsupported");
+        return Ok(report);
+    }
+    // 关联存储与基线共享；用目标档路径承载（同档时两者相同）。
+    match session_link::load_store(target_paths) {
+        StoreState::Missing => report["storeStatus"] = json!("missing"),
+        StoreState::Unavailable(reason) => {
+            report["storeStatus"] = json!("unavailable");
+            report["storeError"] = json!(reason);
+        }
+        StoreState::Ready(store) => {
+            report["storeStatus"] = json!("ready");
+            // 成员数据根：与请求两侧同档的成员直接用请求路径（含单测注入），
+            // 其它档位（历史组）按解析器解析，避免误读。
+            let member_paths = |group: &LinkGroup, member: &LinkMember| -> SessionPaths {
+                let variant = session_link::member_variant(group, member);
+                if variant == source_variant {
+                    source_paths.clone()
+                } else if variant == target_variant {
+                    target_paths.clone()
+                } else {
+                    resolve_source_paths(variant)
+                }
+            };
+            let groups: Vec<Value> = store
+                .groups
+                .iter()
+                .filter(|group| {
+                    has_member_for(group, &source_uid) && has_member_for(group, &target_uid)
+                })
+                .map(|group| {
+                    preview_group_item(target_paths, &member_paths, group, &source_uid, &target_uid)
+                })
                 .collect();
             report["groups"] = json!(groups);
         }
@@ -1622,8 +1960,11 @@ fn session_links_preview_at(
 /// 单个关联组的预览项。
 ///
 /// 记录数与差集只用于向用户解释；能否勾选只由判定结果决定（design §3.2）。
+/// `member_paths` 解析成员所在档位的数据根：同档恒为同一份，跨档按成员档位
+/// （源读源档、目标读目标档）；关联存储与基线与档位无关，统一走 `store_paths`。
 fn preview_group_item(
-    paths: &SessionPaths,
+    store_paths: &SessionPaths,
+    member_paths: &dyn Fn(&LinkGroup, &LinkMember) -> SessionPaths,
     group: &LinkGroup,
     source_uid: &str,
     target_uid: &str,
@@ -1632,7 +1973,10 @@ fn preview_group_item(
     let target_any = group.members.iter().find(|member| member.uid == target_uid);
     // 组展示名取来源会话（同步保留目标的 sessionId、标题与自定义标题）。
     let (title, cwd) = source_any
-        .and_then(|member| session_row_info(paths, &member.session_id))
+        .and_then(|member| {
+            let paths = member_paths(group, member);
+            session_row_info(&paths, &member.session_id)
+        })
         .unwrap_or_else(|| ("(无标题)".to_string(), String::new()));
     let source_summary = member_summary(source_any);
     let target_summary = member_summary(target_any);
@@ -1661,16 +2005,18 @@ fn preview_group_item(
         });
     };
 
+    let source_paths = member_paths(group, source_member);
+    let target_paths = member_paths(group, target_member);
     let baseline = session_link::load_pair_baseline(
-        paths,
+        store_paths,
         group,
         &source_member.member_id,
         &target_member.member_id,
     );
-    let source_content = member_content_state(paths, &source_member.session_id);
-    let target_content = member_content_state(paths, &target_member.session_id);
-    let rows_match =
-        member_row_owned_by(paths, source_member) && member_row_owned_by(paths, target_member);
+    let source_content = member_content_state(&source_paths, &source_member.session_id);
+    let target_content = member_content_state(&target_paths, &target_member.session_id);
+    let rows_match = member_row_owned_by(&source_paths, source_member)
+        && member_row_owned_by(&target_paths, target_member);
     let decision = if rows_match {
         session_link::decide_sync(&source_content, &target_content, &baseline)
     } else {
@@ -1684,7 +2030,9 @@ fn preview_group_item(
         .iter()
         .map(|mode| mode.as_str())
         .collect();
-    let actionable = !modes.is_empty();
+    // Keep ordinary sync unavailable for Ahead, but bind its verified snapshot so the
+    // session-group "use this copy" flow can explicitly request UnifyOverwrite.
+    let actionable = !modes.is_empty() || decision.verdict == SyncVerdict::Ahead;
 
     let mut item = json!({
         "groupId": group.id,
@@ -1715,7 +2063,7 @@ fn preview_group_item(
             &baseline,
             decision.verdict,
         );
-        match session_link::save_preview_token(paths, binding) {
+        match session_link::save_preview_token(store_paths, binding) {
             Ok(preview_id) => item["previewToken"] = json!(preview_id),
             Err(error) => {
                 // 绑定存不下来就不能让用户勾选：不给出可执行动作，并说明原因。
@@ -1780,7 +2128,7 @@ fn plan_sync_selection(
     selection: &SyncSelection,
 ) -> SyncItemOutcome {
     let paths = context.paths;
-    let variant = context.variant;
+    let source_paths = context.source_paths;
     let (source_uid, target_uid) = (context.source_uid, context.target_uid);
     // 凭据必须是我们服务端保存过的：伪造的 id 读不到，直接拒绝。
     let Some(token) = session_link::load_preview_token(paths, &selection.preview_token) else {
@@ -1789,7 +2137,9 @@ fn plan_sync_selection(
         };
     };
     let binding = &token.binding;
-    if binding.variant != variant || binding.group_id != selection.group_id {
+    // 组级 variant 是创建档位，不作为过滤（跨档组两方向都可同步）；
+    // 身份由凭据的组成员绑定与指纹校验（verify_preview）逐项兜底。
+    if binding.group_id != selection.group_id {
         return SyncItemOutcome::Rejected {
             message: "检查结果与所选会话不匹配，已拒绝".to_string(),
         };
@@ -1806,10 +2156,12 @@ fn plan_sync_selection(
     let Some(store) = store else {
         return skip("同步记录不存在或不可用，检查结果已失效".to_string());
     };
+    // 组查找只按 id：跨档组的组级 variant 是创建档位，不作为身份过滤；
+    // 两侧成员身份由 active_member_for 与凭据中的成员绑定逐项校验。
     let Some(group) = store
         .groups
         .iter()
-        .find(|group| group.id == selection.group_id && group.variant == variant)
+        .find(|group| group.id == selection.group_id)
     else {
         return skip("会话的关联关系已不存在，检查结果已失效".to_string());
     };
@@ -1820,11 +2172,14 @@ fn plan_sync_selection(
         return skip("对应的会话已失效，检查结果已失效".to_string());
     };
     // 会话行缺失/归属异常：成员实际已失效（与预览的判定口径一致），提前拦下不写。
-    if !member_row_owned_by(paths, source_member) || !member_row_owned_by(paths, target_member) {
+    // 源行在源档读、目标行在目标档读（跨档时不同数据库）。
+    if !member_row_owned_by(source_paths, source_member)
+        || !member_row_owned_by(paths, target_member)
+    {
         return skip("会话记录缺失或归属异常，检查结果已失效".to_string());
     }
     // 重新加载正文、基线与判定，再与凭据逐项核对；任一变化都跳过（含显式覆盖）。
-    let source_content = member_content_state(paths, &source_member.session_id);
+    let source_content = member_content_state(source_paths, &source_member.session_id);
     let target_content = member_content_state(paths, &target_member.session_id);
     let baseline = session_link::load_pair_baseline(
         paths,
@@ -1917,9 +2272,14 @@ pub fn sync_sessions_for_switch(
 }
 
 /// 同步上下文中不变的输入（避免逐项重复解析身份）。
+///
+/// 源 / 目标解耦：`paths` 恒为目标档（写侧），`source_paths` 恒为源档（读侧）；
+/// 同档同步时两者相同，跨档同步时指向不同数据根。
 struct SyncContext<'a> {
     paths: &'a SessionPaths,
     variant: WbVariant,
+    source_paths: &'a SessionPaths,
+    source_variant: WbVariant,
     source_uid: &'a str,
     source_account_id: Option<String>,
     target_uid: &'a str,
@@ -1941,10 +2301,6 @@ fn sync_sessions_for_switch_at(
     if selections.is_empty() {
         return Ok(json!({ "synced": synced, "skipped": skipped, "errors": errors }));
     }
-    // 与复制同一条生命周期保护：会话写入必须发生在 App 停止写入之后。
-    if is_app_running(variant) {
-        return Err(SESSION_COPY_APP_RUNNING.to_string());
-    }
     if variant == WbVariant::Ai && !session_copy_supported_at(&paths.data_root) {
         return Err(format!(
             "{SESSION_SYNC_UNSUPPORTED}（档位 {}）",
@@ -1960,10 +2316,15 @@ fn sync_sessions_for_switch_at(
     if source_uid == target_uid {
         return Err("当前账号与目标账号相同，无需同步会话".to_string());
     }
+    // 与复制同一条门禁：同档路径的源恒为当前登录账号，这里恒为放行（统一规则）。
+    if app_running_blocks_target_write(paths, variant, &target_uid, &is_app_running) {
+        return Err(SESSION_COPY_APP_RUNNING.to_string());
+    }
 
     // 档位操作锁与复制共用：预览后的校验与写入都不得与并发复制交错。
     let _ops_lock = session_link::try_acquire_variant_ops_lock(paths, variant)?;
-    if is_app_running(variant) {
+    // 复查：锁前未运行、拿锁后目标账号被登录进 App 的情况在这里被拦住。
+    if app_running_blocks_target_write(paths, variant, &target_uid, &is_app_running) {
         return Err(SESSION_COPY_APP_RUNNING.to_string());
     }
     let recovery = recover_pending_session_operations_at(paths, variant);
@@ -1985,6 +2346,8 @@ fn sync_sessions_for_switch_at(
     let context = SyncContext {
         paths,
         variant,
+        source_paths: paths,
+        source_variant: variant,
         source_uid: &source_uid,
         source_account_id: account_id_for_uid(paths, &source_uid),
         target_uid: &target_uid,
@@ -2042,6 +2405,194 @@ fn sync_sessions_for_switch_at(
     }
     // 本轮同步之后再扫一遍：当前项的清理失败/保护残留必须出现在报告里。
     report["temporaryFiles"] = json!(session_backup::maintain(paths, variant));
+    if let Some(items) = report.get_mut("synced").and_then(Value::as_array_mut) {
+        reconcile_reported_cleanup(items);
+    }
+    Ok(report)
+}
+
+/// 把**显式来源账号**的新增内容同步到**显式目标账号**的关联会话（会话管理页；跨档支持）。
+///
+/// 与 [`sync_sessions_for_switch`] 的差异只在来源判定：源 uid 取自 `source_acc`，
+/// 不再从登录态读取；源正文与源行按源档读取，写入侧仍以目标账号为准
+/// （目标档数据根 + 备份 + 基线提交）。现有切号入口不受影响（同档语义逐字保留）。
+pub fn sync_sessions_cross(
+    source_acc: &Value,
+    target_acc: &Value,
+    selections: &[SyncSelection],
+) -> Result<Value, String> {
+    let source_variant = account::variant_of(source_acc);
+    let target_variant = account::variant_of(target_acc);
+    let source_paths = SessionPaths::for_variant(source_variant);
+    let target_paths = SessionPaths::for_variant(target_variant);
+    let source_uid = account_uid(source_acc);
+    if source_uid.is_empty() {
+        return Err("源账号缺少 uid，无法同步会话".to_string());
+    }
+    let target_uid = account_uid(target_acc);
+    if target_uid.is_empty() {
+        return Err("目标账号缺少 uid，无法同步会话".to_string());
+    }
+    let source = CopySide {
+        paths: &source_paths,
+        variant: source_variant,
+        uid: source_uid,
+        account_id: nonempty_text(
+            source_acc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        ),
+    };
+    let target = CopySide {
+        paths: &target_paths,
+        variant: target_variant,
+        uid: target_uid,
+        account_id: nonempty_text(
+            target_acc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        ),
+    };
+    sync_sessions_cross_at(
+        &source,
+        &target,
+        selections,
+        process::is_workbuddy_running,
+        SessionPaths::for_variant,
+    )
+}
+
+/// 可注入路径与「App 是否运行」探针的跨档同步入口（单测注入临时双档目录与假探针）。
+fn sync_sessions_cross_at(
+    source: &CopySide<'_>,
+    target: &CopySide<'_>,
+    selections: &[SyncSelection],
+    is_app_running: impl Fn(WbVariant) -> bool,
+    resolve_source_paths: impl Fn(WbVariant) -> SessionPaths,
+) -> Result<Value, String> {
+    let variant = target.variant;
+    let mut synced: Vec<Value> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    let mut errors: Vec<Value> = Vec::new();
+    if selections.is_empty() {
+        return Ok(json!({ "synced": synced, "skipped": skipped, "errors": errors }));
+    }
+    // 与复制同一条门禁：仅当目标账号是目标档当前登录账号时才要求关闭客户端
+    // （源档只读，运行中的源客户端不影响读取安全）。
+    if app_running_blocks_target_write(target.paths, target.variant, &target.uid, &is_app_running) {
+        return Err(SESSION_COPY_APP_RUNNING.to_string());
+    }
+    // 源档也要读（源正文与源行），国际版数据根不同构时同样不支持（与复制同口径）。
+    if source.variant == WbVariant::Ai && !session_copy_supported_at(&source.paths.data_root) {
+        return Err(format!(
+            "{SESSION_SYNC_UNSUPPORTED}（档位 {}）",
+            source.variant.as_str()
+        ));
+    }
+    if target.variant == WbVariant::Ai && !session_copy_supported_at(&target.paths.data_root) {
+        return Err(format!(
+            "{SESSION_SYNC_UNSUPPORTED}（档位 {}）",
+            target.variant.as_str()
+        ));
+    }
+    if source.variant == target.variant && source.uid == target.uid {
+        return Err("源账号与目标账号相同，无需同步会话".to_string());
+    }
+
+    // 双档操作锁：获取顺序固定为枚举序（Cn → Ai），任何代码路径不得反序（design §2.5）。
+    let mut _ops_locks = Vec::new();
+    for lock_variant in WbVariant::ALL {
+        if lock_variant == source.variant {
+            _ops_locks.push(session_link::try_acquire_variant_ops_lock(
+                source.paths,
+                lock_variant,
+            )?);
+        } else if lock_variant == target.variant {
+            _ops_locks.push(session_link::try_acquire_variant_ops_lock(
+                target.paths,
+                lock_variant,
+            )?);
+        }
+    }
+    // 复查：锁前未运行、拿锁后目标账号被登录进 App 的情况在这里被拦住，不写入任何产物。
+    if app_running_blocks_target_write(target.paths, target.variant, &target.uid, &is_app_running) {
+        return Err(SESSION_COPY_APP_RUNNING.to_string());
+    }
+    let recovery =
+        recover_pending_session_operations_at_with(target.paths, variant, resolve_source_paths);
+    let pending = session_link::pending_operations(target.paths, variant);
+    let (store, store_unavailable) = match session_link::load_store(target.paths) {
+        StoreState::Ready(store) => (Some(store), None),
+        StoreState::Missing => (None, None),
+        StoreState::Unavailable(reason) => (None, Some(reason)),
+    };
+    // 关系表损坏/未知版本，或存在解析不出来的操作日志：不能当成没有关联继续校验。
+    let store_broken = store_unavailable.is_some();
+    let blocked = store_unavailable.or_else(|| {
+        recovery
+            .needs_recovery
+            .iter()
+            .find(|issue| !issue.retryable && issue.reason.contains(UNPARSEABLE_OPERATION_REASON))
+            .map(|issue| issue.reason.clone())
+    });
+    let context = SyncContext {
+        paths: target.paths,
+        variant: target.variant,
+        source_paths: source.paths,
+        source_variant: source.variant,
+        source_uid: &source.uid,
+        source_account_id: source.account_id.clone(),
+        target_uid: &target.uid,
+        target_account_id: target.account_id.clone(),
+        pending: &pending,
+    };
+    match blocked {
+        Some(reason) => {
+            for selection in selections {
+                errors.push(json!({ "groupId": selection.group_id, "error": reason }));
+            }
+        }
+        None => {
+            for selection in selections {
+                match plan_sync_selection(&context, store.as_ref(), selection) {
+                    SyncItemOutcome::Validated {
+                        mode,
+                        verdict,
+                        plan,
+                    } => match execute_sync_item(&context, &plan, mode, verdict) {
+                        Ok(item) => synced.push(item),
+                        Err(error) => {
+                            errors.push(json!({ "groupId": selection.group_id, "error": error }))
+                        }
+                    },
+                    SyncItemOutcome::Skipped {
+                        reason,
+                        message,
+                        verdict,
+                    } => skipped.push(json!({
+                        "groupId": selection.group_id,
+                        "status": "skipped",
+                        "reasonCode": reason,
+                        "message": message,
+                        "verdict": verdict.map(SyncVerdict::as_str),
+                    })),
+                    SyncItemOutcome::Rejected { message } => {
+                        errors.push(json!({ "groupId": selection.group_id, "error": message }))
+                    }
+                }
+            }
+        }
+    }
+
+    let unfinished_after = session_link::pending_operations(target.paths, variant);
+    let needs_recovery = store_broken || !recovery.is_clean() || !unfinished_after.is_empty();
+    let mut report = json!({ "synced": synced, "skipped": skipped, "errors": errors });
+    if needs_recovery {
+        report["needsRecovery"] = json!(true);
+    }
+    report["temporaryFiles"] = json!(session_backup::maintain(target.paths, variant));
     if let Some(items) = report.get_mut("synced").and_then(Value::as_array_mut) {
         reconcile_reported_cleanup(items);
     }
@@ -2583,9 +3134,10 @@ fn update_target_session_row(
 /// 提交 A/B 新基线与目标成员 lastSyncedAt（定向更新，不触碰其它配对）。
 ///
 /// 新基线用新的 ref，避免覆盖被其它成员对继承的历史基线（A/B 同步不代表 C 也同步）。
+/// 组查找只按 id（跨档组的组级 variant 是创建档位，不作过滤）；成员身份由下面的
+/// member_id 校验兜底。
 fn commit_sync_baseline(
     paths: &SessionPaths,
-    variant: WbVariant,
     manifest: &SyncBackupManifest,
     normalized: &NormalizedContent,
 ) -> Result<(), String> {
@@ -2595,7 +3147,7 @@ fn commit_sync_baseline(
         let Some(group) = store
             .groups
             .iter_mut()
-            .find(|group| group.id == manifest.group_id && group.variant == variant)
+            .find(|group| group.id == manifest.group_id)
         else {
             return Err("会话的关联关系已不存在，未提交同步结果".to_string());
         };
@@ -2689,7 +3241,6 @@ fn restore_sync_backup_body(
 /// 因此恢复不会产生第二份写入。
 fn run_sync_phases(
     paths: &SessionPaths,
-    variant: WbVariant,
     operation: &mut Operation,
     backup_dir: &Path,
     manifest: &SyncBackupManifest,
@@ -2741,7 +3292,7 @@ fn run_sync_phases(
     advance_operation(paths, operation, OpPhase::DbWritten)?;
 
     if operation.phase < OpPhase::LinksCommitted {
-        commit_sync_baseline(paths, variant, manifest, &normalized)?;
+        commit_sync_baseline(paths, manifest, &normalized)?;
         advance_operation(paths, operation, OpPhase::LinksCommitted)?;
     } else {
         verify_sync_baseline_committed(paths, manifest)?;
@@ -2816,6 +3367,9 @@ fn execute_sync_item(
         operation_id: lifecycle.operation_id.clone(),
         kind: OPERATION_KIND_SYNC.to_string(),
         variant: context.variant,
+        // 同档同步写 None（与旧记录逐字兼容）；跨档同步显式记录源档（审计与恢复依据）。
+        source_variant: (context.source_variant != context.variant)
+            .then_some(context.source_variant),
         group_id: plan.group_id.clone(),
         source: OperationMember {
             account_id: context.source_account_id.clone(),
@@ -2845,14 +3399,8 @@ fn execute_sync_item(
         &plan.target_snapshot.full_digest,
         &operation.expected_content_digest,
     );
-    if let Err(error) = run_sync_phases(
-        paths,
-        context.variant,
-        &mut operation,
-        &backup.dir,
-        &backup.manifest,
-        body,
-    ) {
+    if let Err(error) = run_sync_phases(paths, &mut operation, &backup.dir, &backup.manifest, body)
+    {
         fail_operation(paths, &mut operation, &error);
         return Err(error);
     }
@@ -2899,10 +3447,26 @@ fn execute_sync_item(
 ///
 /// 恢复先检查实际状态再决定下一步，不盲目重放；中间产物被改动或丢失时只上报
 /// needsRecovery，不覆盖未知内容。
+///
+/// 跨档操作的源档数据根按 [`SessionPaths::for_variant`] 解析；单测与需要注入
+/// 临时目录的宿主用 [`recover_pending_session_operations_at_with`]。
 pub fn recover_pending_session_operations_at(
     paths: &SessionPaths,
     variant: WbVariant,
 ) -> RecoveryReport {
+    recover_pending_session_operations_at_with(paths, variant, SessionPaths::for_variant)
+}
+
+/// [`recover_pending_session_operations_at`] 的可注入版本：`resolve_source_paths`
+/// 用于解析跨档操作（`sourceVariant` 与操作档不同）的源档数据根。
+pub fn recover_pending_session_operations_at_with<F>(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    resolve_source_paths: F,
+) -> RecoveryReport
+where
+    F: Fn(WbVariant) -> SessionPaths,
+{
     let mut report = RecoveryReport::default();
     let scan = session_link::scan_operations(paths);
     // 扫描不完整（目录不可读/枚举失败）不能按「没有未完成操作」继续写：与解析失败
@@ -2930,7 +3494,12 @@ pub fn recover_pending_session_operations_at(
         .into_iter()
         .filter(|operation| operation.variant == variant && operation.phase.is_unfinished())
     {
-        match recover_operation(paths, variant, operation) {
+        // 跨档操作（源档与操作档不同）按源档解析读侧数据根；同档与旧记录视为同档。
+        let source_paths = operation
+            .source_variant
+            .filter(|source_variant| *source_variant != operation.variant)
+            .map(&resolve_source_paths);
+        match recover_operation(paths, variant, operation, source_paths.as_ref()) {
             RecoverOutcome::Recovered(id) => report.recovered.push(id),
             RecoverOutcome::Abandoned(id) => report.abandoned.push(id),
             RecoverOutcome::NeedsRecovery {
@@ -2955,7 +3524,11 @@ pub fn recover_pending_session_operations_at(
 pub fn recover_pending_session_operations(variant: WbVariant) -> Result<RecoveryReport, String> {
     let paths = SessionPaths::for_variant(variant);
     let _lock = session_link::try_acquire_variant_ops_lock(&paths, variant)?;
-    Ok(recover_pending_session_operations_at(&paths, variant))
+    Ok(recover_pending_session_operations_at_with(
+        &paths,
+        variant,
+        SessionPaths::for_variant,
+    ))
 }
 
 enum RecoverOutcome {
@@ -3013,11 +3586,12 @@ fn recover_operation(
     paths: &SessionPaths,
     variant: WbVariant,
     operation: Operation,
+    source_paths: Option<&SessionPaths>,
 ) -> RecoverOutcome {
     if operation.kind == OPERATION_KIND_SYNC {
-        return recover_sync_operation(paths, variant, operation);
+        return recover_sync_operation(paths, operation);
     }
-    recover_copy_operation(paths, variant, operation)
+    recover_copy_operation(paths, variant, operation, source_paths)
 }
 
 /// 恢复一次同步（design §5.6）：先校验现场，再按清单补完，绝不覆盖未知内容。
@@ -3025,11 +3599,7 @@ fn recover_operation(
 /// 顺序：备份必须完好 → 目标正文只能是「本次写入的」或「覆盖前的」→ 目标行归属与
 /// 更新时间必须可安全识别 → 复用同一段阶段代码补完。任一项不满足即停止并上报
 /// needsRecovery（阻断启动，宿主必须等待恢复一致后才能启动 App）。
-fn recover_sync_operation(
-    paths: &SessionPaths,
-    variant: WbVariant,
-    mut operation: Operation,
-) -> RecoverOutcome {
+fn recover_sync_operation(paths: &SessionPaths, mut operation: Operation) -> RecoverOutcome {
     let operation_id = operation.operation_id.clone();
     let needs = |reason: String, retryable: bool| RecoverOutcome::NeedsRecovery {
         id: operation_id.clone(),
@@ -3132,7 +3702,7 @@ fn recover_sync_operation(
     }
 
     // 4) 复用同一段阶段代码补完（阶段只前进，已越过的阶段只核验不重放）。
-    match run_sync_phases(paths, variant, &mut operation, &backup_dir, &manifest, body) {
+    match run_sync_phases(paths, &mut operation, &backup_dir, &manifest, body) {
         Ok(()) => RecoverOutcome::Recovered(operation_id),
         Err(error) => {
             fail_operation(paths, &mut operation, &error);
@@ -3147,6 +3717,7 @@ fn recover_copy_operation(
     paths: &SessionPaths,
     variant: WbVariant,
     mut operation: Operation,
+    source_paths: Option<&SessionPaths>,
 ) -> RecoverOutcome {
     let operation_id = operation.operation_id.clone();
     let needs = |reason: String, retryable: bool| RecoverOutcome::NeedsRecovery {
@@ -3154,13 +3725,16 @@ fn recover_copy_operation(
         reason,
         retryable,
     };
+    // 读侧数据根：跨档操作由调用方解析出的源档；同档与旧记录用目标档。
+    let read_paths = source_paths.unwrap_or(paths);
 
     // 1) 目标正文：已写成则直接复用；未写成则用当前源内容补写；被改动则停止。
     let normalized = match check_target_body(paths, &operation) {
         BodyCheck::Verified(normalized) => normalized,
         BodyCheck::NeedsRecovery(reason) => return needs(reason, false),
         BodyCheck::Absent => {
-            let Some(source_path) = find_project_jsonl(paths, &operation.source.session_id) else {
+            let Some(source_path) = find_project_jsonl(read_paths, &operation.source.session_id)
+            else {
                 abandon_operation(paths, &mut operation);
                 return RecoverOutcome::Abandoned(operation_id);
             };
@@ -3182,6 +3756,8 @@ fn recover_copy_operation(
             if let Err(error) = write_copy_body(
                 &source,
                 &source_path,
+                read_paths,
+                paths,
                 &operation.source.session_id,
                 &operation.target.session_id,
             ) {
@@ -3206,6 +3782,7 @@ fn recover_copy_operation(
                 return needs("目标会话记录丢失，已停止恢复".to_string(), false);
             }
             match insert_session_copy(
+                read_paths,
                 paths,
                 &operation.target.session_id,
                 &operation.source.session_id,
@@ -3234,31 +3811,13 @@ fn recover_copy_operation(
         return needs(error, true);
     }
 
-    // 3) 云端映射：已越过该阶段就不再重新登记（恢复不重放已完成的阶段）；
-    // 但必须核验产物仍在，phase 写完、行却丢了时要报 needsRecovery，不能直接 Completed。
+    // 3) 云端登记已交接给客户端（不预写 edge_sync_mapping）：这里只推进阶段，
+    // 不写入、不核验映射行——该行由 edge-sync 扩展在客户端下次启动时写入，
+    // 工具恢复时不能要求它已存在，否则会误报 needsRecovery。
     if operation.phase < OpPhase::MappingWritten {
-        match register_edge_sync_mapping(
-            paths,
-            variant,
-            &operation.target.session_id,
-            &operation.target.uid,
-        ) {
-            MappingOutcome::Registered => {}
-            MappingOutcome::Unavailable(reason) => {
-                fail_operation(paths, &mut operation, &reason);
-                return needs(reason, true);
-            }
-        }
         if let Err(error) = advance_operation(paths, &mut operation, OpPhase::MappingWritten) {
             return needs(error, true);
         }
-    } else if !mapping_row_matches(
-        paths,
-        variant,
-        &operation.target.session_id,
-        &operation.target.uid,
-    ) {
-        return needs("云端映射丢失或被改动，已停止恢复".to_string(), false);
     }
 
     // 4) 关联与基线：已提交过就不再 commit_links，避免重复写关联存储与基线；
@@ -4002,7 +4561,7 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn copy_writes_body_row_mapping_and_link_group() {
+    fn copy_writes_body_row_and_link_group() {
         let env = ready_env("happy");
         let report = copy(&env, "uid-b", &["sess-1"]);
 
@@ -4030,16 +4589,8 @@ mod tests {
         assert_eq!(env.rows_for("uid-b"), vec![new_id.clone()]);
         assert_eq!(env.rows_for("uid-a"), vec!["sess-1".to_string()]);
 
-        // 云端映射沿用既有登记：convmsg:{target_uid}。
-        let conn = Connection::open(env.paths.edge_sync_db(WbVariant::Cn)).unwrap();
-        let channel: String = conn
-            .query_row(
-                "SELECT msg_channel FROM edge_sync_mapping WHERE session_id = ?1",
-                [&new_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(channel, "convmsg:uid-b");
+        // 不预写云端映射：登记交接给客户端（edge-sync 扩展迁移时自行写入）。
+        assert_eq!(env.mapping_rows(), 0, "复制不得预写映射行");
 
         // 关联组：同一逻辑会话、两个账号各一个 active 成员、一对基线。
         let store = env.store();
@@ -4376,6 +4927,7 @@ mod tests {
                         account_id: Some("acc-uid-a".to_string()),
                         uid: "uid-a".to_string(),
                         session_id: "sess-1".to_string(),
+                        variant: None,
                         state: MemberState::Active,
                         linked_at: 1,
                         last_synced_at: None,
@@ -4385,6 +4937,7 @@ mod tests {
                         account_id: Some("old-account-id".to_string()),
                         uid: "uid-b".to_string(),
                         session_id: "sess-b".to_string(),
+                        variant: None,
                         state: MemberState::Active,
                         linked_at: 1,
                         last_synced_at: None,
@@ -4588,47 +5141,22 @@ mod tests {
         assert_eq!(report["errors"][0]["error"], "源会话不属于当前账号，未复制");
     }
 
-    /// 映射登记失败 → 不报完整成功；修好后重试复用同一 UUID，不产生第二个副本。
+    /// 复制不再依赖云端映射库：库缺失也照常成功，不重建、不写行。
     #[test]
-    fn mapping_failure_keeps_pending_then_retry_reuses_same_uuid() {
-        let env = ready_env("mapping");
+    fn copy_succeeds_without_edge_sync_db() {
+        let env = ready_env("mapping-absent");
         std::fs::remove_file(env.paths.edge_sync_db(WbVariant::Cn)).unwrap();
 
-        let failed = copy(&env, "uid-b", &["sess-1"]);
-        assert_eq!(failed["copied"].as_array().unwrap().len(), 0);
-        let error = failed["errors"][0]["error"].as_str().unwrap();
-        assert!(error.contains("云端映射库"), "{error}");
-        assert_eq!(failed["needsRecovery"], true);
-        assert_eq!(
-            env.body_files().len(),
-            2,
-            "内容与数据库行已写入，未按成功处理"
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        assert_eq!(report["copied"].as_array().unwrap().len(), 1);
+        assert!(report.get("errors").is_none(), "{report}");
+        assert_eq!(env.body_files().len(), 2);
+        assert_eq!(env.rows_for("uid-b").len(), 1);
+        assert!(
+            !env.paths().edge_sync_db(WbVariant::Cn).exists(),
+            "复制不得创建或写入映射库"
         );
-
-        let pending = session_link::pending_operations(&env.paths(), WbVariant::Cn);
-        assert_eq!(pending.len(), 1);
-        let new_id = pending[0].target.session_id.clone();
-        assert!(pending[0].phase < crate::modules::session_link::OpPhase::Completed);
-
-        // 映射库恢复后重试：恢复流程补齐，随后报告 alreadyLinked，UUID 不变。
-        env.create_edge_db(WbVariant::Cn);
-        let retry = copy(&env, "uid-b", &["sess-1"]);
-        assert_eq!(retry["copied"].as_array().unwrap().len(), 0);
-        assert_eq!(retry["alreadyLinked"][0]["sessionId"], new_id);
-        assert!(retry.get("errors").is_none());
         assert!(session_link::pending_operations(&env.paths(), WbVariant::Cn).is_empty());
-        assert_eq!(env.body_files().len(), 2, "恢复不得产生第二个副本");
-        assert_eq!(env.rows_for("uid-b"), vec![new_id.clone()]);
-
-        let conn = Connection::open(env.paths.edge_sync_db(WbVariant::Cn)).unwrap();
-        let channel: String = conn
-            .query_row(
-                "SELECT msg_channel FROM edge_sync_mapping WHERE session_id = ?1",
-                [&new_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(channel, "convmsg:uid-b");
     }
 
     /// 关联提交失败（存储目录不可写）→ 不报成功；恢复后同一 UUID 完成。
@@ -4797,10 +5325,11 @@ mod tests {
         assert_eq!(report["copied"].as_array().unwrap().len(), 1);
     }
 
-    /// 拿档位锁后复查 App 是否运行：锁前未运行、拿锁后已被启动 → 拒绝且不写任何产物。
+    /// 目标账号不是当前登录账号（auth=uid-a）时，App 运行中不再拦截写入（S5 实测口径）；
+    /// 快拒与锁后复查仍各执行一次，且复查必须发生在持锁之后、写入之前。
     #[test]
-    fn copy_rechecks_app_running_after_acquiring_lock() {
-        let env = ready_env("app-raced");
+    fn copy_runs_while_app_running_for_non_current_account() {
+        let env = ready_env("app-running-non-current");
         let probes = std::cell::Cell::new(0usize);
         let lock_held_on_recheck = std::cell::Cell::new(false);
         let lock_path = env.paths.variant_ops_lock_file(WbVariant::Cn);
@@ -4808,7 +5337,7 @@ mod tests {
             let n = probes.get() + 1;
             probes.set(n);
             if n == 1 {
-                false
+                true
             } else {
                 // 第二次必须发生在持锁之后：此时再抢同一把锁应为 Busy。
                 match session_link::try_lock_file(&lock_path) {
@@ -4821,31 +5350,22 @@ mod tests {
                 true
             }
         };
-        let err = copy_sessions_for_switch_at(
+        let report = copy_sessions_for_switch_at(
             &env.paths(),
             WbVariant::Cn,
             &env.target("uid-b"),
             &["sess-1".to_string()],
             probe,
         )
-        .expect_err("拿锁后复查为运行中必须拒绝");
-        assert_eq!(err, SESSION_COPY_APP_RUNNING);
-        assert_eq!(probes.get(), 2, "锁前与锁后各检查一次");
+        .expect("目标非当前登录账号：运行中必须放行");
+        assert_eq!(report["copied"].as_array().unwrap().len(), 1);
+        assert_eq!(probes.get(), 2, "快拒与锁后复查各检查一次");
         assert!(
             lock_held_on_recheck.get(),
             "复查必须发生在已经拿到档位锁之后、任何写入之前"
         );
-        assert_eq!(env.body_files().len(), 1, "不得写入复制后的内容");
-        assert_eq!(env.rows_for("uid-b").len(), 0, "不得写入数据库行");
-        assert!(
-            !env.paths.session_links_file().exists(),
-            "不得初始化同步记录"
-        );
-        assert!(session_link::pending_operations(&env.paths(), WbVariant::Cn).is_empty());
-
-        // 锁已释放：探针改回「未运行」后复制照常成功。
-        let report = copy(&env, "uid-b", &["sess-1"]);
-        assert_eq!(report["copied"].as_array().unwrap().len(), 1);
+        assert_eq!(env.rows_for("uid-b").len(), 1, "副本行已写入");
+        assert!(env.paths.session_links_file().exists(), "关联记录已建立");
     }
 
     // ---------------------------------------------------------------------------
@@ -4863,6 +5383,7 @@ mod tests {
                 operation_id: "op-gone".to_string(),
                 kind: "copy".to_string(),
                 variant: WbVariant::Cn,
+                source_variant: None,
                 group_id: "g-gone".to_string(),
                 source: OperationMember {
                     account_id: None,
@@ -4897,13 +5418,18 @@ mod tests {
     #[test]
     fn recovery_stops_when_intermediate_body_was_modified() {
         let env = ready_env("recovery-stop");
-        std::fs::remove_file(env.paths.edge_sync_db(WbVariant::Cn)).unwrap();
-        let failed = copy(&env, "uid-b", &["sess-1"]);
-        assert_eq!(failed["needsRecovery"], true);
-        let new_id = session_link::pending_operations(&env.paths(), WbVariant::Cn)[0]
-            .target
-            .session_id
-            .clone();
+        let first = copy(&env, "uid-b", &["sess-1"]);
+        let new_id = env.first_copy_id(&first);
+        let paths = env.paths();
+
+        // 模拟"正文已写、后续阶段中断"：把已完成的操作日志回退到 BodyWritten。
+        let mut operation = session_link::scan_operations(&paths)
+            .operations
+            .into_iter()
+            .find(|operation| operation.target.session_id == new_id)
+            .expect("应能找到该副本的操作记录");
+        operation.phase = OpPhase::BodyWritten;
+        session_link::save_operation(&paths, &operation).unwrap();
 
         // 中间产物被其它程序改动 → 停止恢复，不覆盖。
         let tampered = format!(
@@ -4912,7 +5438,7 @@ mod tests {
         );
         std::fs::write(env.body_path(&new_id), &tampered).unwrap();
 
-        let report = recover_pending_session_operations_at(&env.paths(), WbVariant::Cn);
+        let report = recover_pending_session_operations_at(&paths, WbVariant::Cn);
         assert!(!report.is_clean());
         let issue = &report.needs_recovery[0];
         assert!(!issue.retryable);
@@ -4927,7 +5453,6 @@ mod tests {
         );
 
         // 该会话再次请求时不新建副本，而是报告未完成。
-        env.create_edge_db(WbVariant::Cn);
         let again = copy(&env, "uid-b", &["sess-1"]);
         assert_eq!(again["copied"].as_array().unwrap().len(), 0);
         assert_eq!(again["errors"].as_array().unwrap().len(), 1);
@@ -4938,23 +5463,19 @@ mod tests {
         assert_eq!(env.body_files().len(), 2, "不得产生第二个副本");
     }
 
+    /// 复制完成后再次请求同一会话：报告 alreadyLinked，不新建副本。
     #[test]
-    fn retry_after_partial_copy_does_not_duplicate() {
+    fn retry_after_completed_copy_does_not_duplicate() {
         let env = ready_env("partial-resume");
-        std::fs::remove_file(env.paths.edge_sync_db(WbVariant::Cn)).unwrap();
-        copy(&env, "uid-b", &["sess-1"]);
-        let body_count_after_failure = env.body_files().len();
+        let first = copy(&env, "uid-b", &["sess-1"]);
+        let new_id = env.first_copy_id(&first);
+        let body_count = env.body_files().len();
+        assert_eq!(body_count, 2);
 
-        // 未修复映射库就再次请求：不得新建副本。
         let again = copy(&env, "uid-b", &["sess-1"]);
         assert_eq!(again["copied"].as_array().unwrap().len(), 0);
-        assert_eq!(env.body_files().len(), body_count_after_failure);
-
-        // 修好后恢复完成。
-        env.create_edge_db(WbVariant::Cn);
-        let retry = copy(&env, "uid-b", &["sess-1"]);
-        assert_eq!(retry["alreadyLinked"].as_array().unwrap().len(), 1);
-        assert_eq!(env.body_files().len(), body_count_after_failure);
+        assert_eq!(again["alreadyLinked"][0]["sessionId"], new_id);
+        assert_eq!(env.body_files().len(), body_count, "不得产生第二个副本");
         assert_eq!(env.rows_for("uid-b").len(), 1);
     }
 
@@ -4996,7 +5517,11 @@ mod tests {
         );
         assert_eq!(after.groups[0].members.len(), members_before);
         assert_eq!(env.baseline_files(), baselines_before, "不得新增基线文件");
-        assert_eq!(env.mapping_rows(), 1, "不得重复登记云端映射");
+        assert_eq!(
+            env.mapping_rows(),
+            0,
+            "复制不再预写云端映射，恢复也不得补写"
+        );
         assert_eq!(env.body_files().len(), 2, "不得产生第二个副本");
         assert_eq!(env.rows_for("uid-b"), vec![new_id]);
         assert!(session_link::pending_operations(&paths, WbVariant::Cn).is_empty());
@@ -5037,48 +5562,6 @@ mod tests {
             session_link::pending_operations(&paths, WbVariant::Cn).len(),
             1,
             "必须保留未完成操作，不能标 Completed"
-        );
-    }
-
-    /// phase 已越过 MappingWritten，但映射行被删：不得跳过核验后标 Completed。
-    #[test]
-    fn recovery_stops_when_mapping_row_is_missing() {
-        let env = ready_env("recover-mapping-gone");
-        let first = copy(&env, "uid-b", &["sess-1"]);
-        let new_id = env.first_copy_id(&first);
-        let paths = env.paths();
-
-        let mut operation = session_link::scan_operations(&paths)
-            .operations
-            .into_iter()
-            .find(|operation| operation.target.session_id == new_id)
-            .expect("应能找到该副本的操作记录");
-        operation.phase = OpPhase::LinksCommitted;
-        session_link::save_operation(&paths, &operation).unwrap();
-
-        let conn = Connection::open(paths.edge_sync_db(WbVariant::Cn)).unwrap();
-        conn.execute(
-            "DELETE FROM edge_sync_mapping WHERE session_id = ?1",
-            [&new_id],
-        )
-        .unwrap();
-        drop(conn);
-
-        let revision_before = env.store().revision;
-        let report = recover_pending_session_operations_at(&paths, WbVariant::Cn);
-        assert!(report.recovered.is_empty(), "{:?}", report.recovered);
-        assert_eq!(report.needs_recovery.len(), 1);
-        assert!(!report.needs_recovery[0].retryable);
-        assert!(
-            report.needs_recovery[0].reason.contains("云端映射"),
-            "{}",
-            report.needs_recovery[0].reason
-        );
-        assert_eq!(env.store().revision, revision_before, "不得重写同步记录");
-        assert_eq!(env.mapping_rows(), 0, "不得悄悄补登记映射");
-        assert_eq!(
-            session_link::pending_operations(&paths, WbVariant::Cn).len(),
-            1
         );
     }
 
@@ -5177,13 +5660,6 @@ mod tests {
         assert_eq!(sessions[0]["hasHistory"], false);
     }
 
-    fn temp_db(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "wb_switch_test_{}_{name}.db",
-            uuid::Uuid::new_v4().simple()
-        ))
-    }
-
     #[test]
     fn insert_session_copy_duplicates_row_with_target_uid() {
         let env = ready_env("insert");
@@ -5196,8 +5672,15 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let outcome =
-            insert_session_copy(&env.paths(), "new-uuid-1", "src-1", "uid-a", "uid-b").unwrap();
+        let outcome = insert_session_copy(
+            &env.paths(),
+            &env.paths(),
+            "new-uuid-1",
+            "src-1",
+            "uid-a",
+            "uid-b",
+        )
+        .unwrap();
         assert_eq!(outcome, DbCopyOutcome::Inserted);
 
         let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
@@ -5219,57 +5702,32 @@ mod tests {
     fn insert_session_copy_reports_missing_source_and_db() {
         let env = ready_env("insert-missing");
         assert_eq!(
-            insert_session_copy(&env.paths(), "new-1", "missing", "uid-a", "uid-b").unwrap(),
+            insert_session_copy(
+                &env.paths(),
+                &env.paths(),
+                "new-1",
+                "missing",
+                "uid-a",
+                "uid-b"
+            )
+            .unwrap(),
             DbCopyOutcome::SourceRowMissing,
             "源行缺失必须显式上报，不能当成功（旧实现的假成功）"
         );
 
         std::fs::remove_file(env.paths.workbuddy_db()).unwrap();
         assert_eq!(
-            insert_session_copy(&env.paths(), "new-1", "sess-1", "uid-a", "uid-b").unwrap(),
+            insert_session_copy(
+                &env.paths(),
+                &env.paths(),
+                "new-1",
+                "sess-1",
+                "uid-a",
+                "uid-b"
+            )
+            .unwrap(),
             DbCopyOutcome::NoDb
         );
-    }
-
-    #[test]
-    fn register_edge_sync_mapping_reports_unavailable_reasons() {
-        let env = ready_env("edge-outcome");
-        // 缺表。
-        let db = temp_db("edge-no-table");
-        let conn = Connection::open(&db).unwrap();
-        conn.execute_batch("CREATE TABLE other (x INTEGER);")
-            .unwrap();
-        drop(conn);
-        let paths = SessionPaths {
-            store_root: env.root.join("s2"),
-            data_root: temp_db("edge-root"),
-            auth_file: env.root.join("auth2.info"),
-            link_namespace: LinkNamespace::WorkBuddy,
-        };
-        std::fs::create_dir_all(&paths.data_root).unwrap();
-        std::fs::copy(&db, paths.edge_sync_db(WbVariant::Cn)).unwrap();
-        assert!(matches!(
-            register_edge_sync_mapping(&paths, WbVariant::Cn, "new-1", "uid-b"),
-            MappingOutcome::Unavailable(_)
-        ));
-        let _ = std::fs::remove_file(&db);
-
-        // 正常登记。
-        assert!(matches!(
-            register_edge_sync_mapping(&env.paths(), WbVariant::Cn, "new-1", "uid-b"),
-            MappingOutcome::Registered
-        ));
-        let conn = Connection::open(env.paths.edge_sync_db(WbVariant::Cn)).unwrap();
-        let (sid, cid, channel): (String, String, String) = conn
-            .query_row(
-                "SELECT session_id, conversation_id, msg_channel FROM edge_sync_mapping",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(sid, "new-1");
-        assert_eq!(cid, "new-1");
-        assert_eq!(channel, "convmsg:uid-b");
     }
 
     #[test]
@@ -5300,6 +5758,828 @@ mod tests {
         assert_eq!(session_row_owner(&env.paths(), "missing"), None);
         env.delete_row("sess-1");
         assert_eq!(session_row_owner(&env.paths(), "sess-1"), None);
+    }
+
+    // ---------------------------------------------------------------------------
+    // 跨档复制（WorkBuddy 国内版 ↔ 国际版）
+    // ---------------------------------------------------------------------------
+
+    /// 双档测试环境：共享工具存储根（关联表/锁/备份）+ 两个档位数据根（CN 与 AI）。
+    struct CrossEnv {
+        root: PathBuf,
+        store_root: PathBuf,
+        cn_data: PathBuf,
+        ai_data: PathBuf,
+    }
+
+    impl CrossEnv {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "wb_switch_cross_test_{}_{name}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let store_root = root.join("store");
+            let cn_data = root.join("cn-data");
+            let ai_data = root.join("ai-data");
+            for data in [&cn_data, &ai_data] {
+                std::fs::create_dir_all(data.join("projects").join("ws-a")).unwrap();
+            }
+            CrossEnv {
+                root,
+                store_root,
+                cn_data,
+                ai_data,
+            }
+        }
+
+        fn paths(&self, variant: WbVariant) -> SessionPaths {
+            SessionPaths {
+                store_root: self.store_root.clone(),
+                data_root: match variant {
+                    WbVariant::Cn => self.cn_data.clone(),
+                    WbVariant::Ai => self.ai_data.clone(),
+                },
+                // 跨档入口不读登录态（源 uid 由调用方显式传入）；门禁用它判断
+                // 目标账号是否为该档当前登录账号。
+                auth_file: self
+                    .store_root
+                    .join(format!("auth-{}.info", variant.as_str())),
+                link_namespace: LinkNamespace::WorkBuddy,
+            }
+        }
+
+        /// 写入指定档位的登录态（门禁读 `account.uid` 判定目标是否当前登录账号）。
+        fn set_login(&self, variant: WbVariant, uid: &str) {
+            let path = self.paths(variant).auth_file;
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, json!({"account": {"uid": uid}}).to_string()).unwrap();
+        }
+
+        /// 建 sessions 表；`extra` 追加一列，用于模拟两档列集合差异。
+        fn create_db(&self, variant: WbVariant, extra: &str) {
+            let conn = Connection::open(self.paths(variant).workbuddy_db()).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    title TEXT,
+                    custom_title TEXT,
+                    cwd TEXT,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    deleted_at INTEGER,
+                    is_playground INTEGER{extra}
+                );"
+            ))
+            .unwrap();
+        }
+
+        fn create_edge_db(&self, variant: WbVariant) {
+            let conn = Connection::open(self.paths(variant).edge_sync_db(variant)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE edge_sync_mapping (
+                    session_id TEXT,
+                    conversation_id TEXT,
+                    msg_channel TEXT,
+                    created_at INTEGER
+                );",
+            )
+            .unwrap();
+        }
+
+        fn add_session(&self, variant: WbVariant, id: &str, uid: &str, title: &str) {
+            let conn = Connection::open(self.paths(variant).workbuddy_db()).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, user_id, title, custom_title, cwd, created_at, updated_at, deleted_at, is_playground)
+                 VALUES (?1, ?2, ?3, NULL, '/ws/a', 1000, 2000, NULL, 0)",
+                rusqlite::params![id, uid, title],
+            )
+            .unwrap();
+        }
+
+        fn add_body(&self, variant: WbVariant, cid: &str, text: &str) {
+            std::fs::write(
+                self.paths(variant)
+                    .projects_dir()
+                    .join("ws-a")
+                    .join(format!("{cid}.jsonl")),
+                text,
+            )
+            .unwrap();
+        }
+
+        fn body_path(&self, variant: WbVariant, cid: &str) -> PathBuf {
+            self.paths(variant)
+                .projects_dir()
+                .join("ws-a")
+                .join(format!("{cid}.jsonl"))
+        }
+
+        fn rows_for(&self, variant: WbVariant, uid: &str) -> Vec<String> {
+            let conn = Connection::open(self.paths(variant).workbuddy_db()).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id FROM sessions WHERE user_id = ?1 AND deleted_at IS NULL")
+                .unwrap();
+            let mut rows: Vec<String> = stmt
+                .query_map([uid], |row| row.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+                .collect();
+            rows.sort();
+            rows
+        }
+
+        fn mapping_rows(&self, variant: WbVariant) -> Vec<(String, String)> {
+            let conn = Connection::open(self.paths(variant).edge_sync_db(variant)).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT session_id, msg_channel FROM edge_sync_mapping ORDER BY session_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .flatten()
+                .collect()
+        }
+
+        fn delete_session(&self, variant: WbVariant, id: &str) {
+            let conn = Connection::open(self.paths(variant).workbuddy_db()).unwrap();
+            conn.execute("DELETE FROM sessions WHERE id = ?1", [id])
+                .unwrap();
+        }
+    }
+
+    impl Drop for CrossEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn cross_side<'a>(paths: &'a SessionPaths, variant: WbVariant, uid: &str) -> CopySide<'a> {
+        CopySide {
+            paths,
+            variant,
+            uid: uid.to_string(),
+            account_id: Some(format!("acc-{uid}")),
+        }
+    }
+
+    /// 可注入双档临时目录的复制调用（解析器与两条 side 一致，不触碰真实路径）。
+    fn cross_copy(
+        env: &CrossEnv,
+        source_variant: WbVariant,
+        source_uid: &str,
+        target_variant: WbVariant,
+        target_uid: &str,
+        ids: &[&str],
+    ) -> Value {
+        let source_paths = env.paths(source_variant);
+        let target_paths = env.paths(target_variant);
+        let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        copy_sessions_cross_at(
+            cross_side(&source_paths, source_variant, source_uid),
+            cross_side(&target_paths, target_variant, target_uid),
+            &ids,
+            |_| false,
+            |variant| env.paths(variant),
+        )
+        .unwrap()
+    }
+
+    /// 与 `cross_copy` 相同，但注入「App 是否运行」探针（门禁测试用）。
+    fn cross_copy_with_probe(
+        env: &CrossEnv,
+        source_variant: WbVariant,
+        source_uid: &str,
+        target_variant: WbVariant,
+        target_uid: &str,
+        ids: &[&str],
+        is_app_running: impl Fn(WbVariant) -> bool,
+    ) -> Result<Value, String> {
+        let source_paths = env.paths(source_variant);
+        let target_paths = env.paths(target_variant);
+        let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        copy_sessions_cross_at(
+            cross_side(&source_paths, source_variant, source_uid),
+            cross_side(&target_paths, target_variant, target_uid),
+            &ids,
+            is_app_running,
+            |variant| env.paths(variant),
+        )
+    }
+
+    /// 跨档门禁只拦「目标账号 = 目标档当前登录账号」：App 运行中
+    /// 目标≠当前登录 → 放行；目标=当前登录 → 拒绝；读不到登录态 → 保守拒绝。
+    #[test]
+    fn cross_copy_gate_only_blocks_current_login_target() {
+        let env = CrossEnv::new("cross-gate");
+        env.create_db(WbVariant::Cn, "");
+        env.create_edge_db(WbVariant::Cn);
+        env.create_db(WbVariant::Ai, "");
+        env.create_edge_db(WbVariant::Ai);
+        env.add_session(WbVariant::Cn, "sess-1", "uid-a", "标题一");
+        env.add_body(WbVariant::Cn, "sess-1", &body_text("sess-1"));
+
+        let run = |uid: &str| {
+            cross_copy_with_probe(
+                &env,
+                WbVariant::Cn,
+                "uid-a",
+                WbVariant::Ai,
+                uid,
+                &["sess-1"],
+                |_| true,
+            )
+        };
+
+        // 目标档登录的是别人（uid-x）：运行中放行，副本落库。
+        env.set_login(WbVariant::Ai, "uid-x");
+        let report = run("uid-b").expect("目标≠当前登录：运行中必须放行");
+        let new_id = report["copied"][0]["newId"].as_str().unwrap().to_string();
+        assert_eq!(env.rows_for(WbVariant::Ai, "uid-b"), vec![new_id]);
+
+        // 目标账号正是目标档当前登录账号：运行中拒绝，且不再写入。
+        env.set_login(WbVariant::Ai, "uid-b");
+        let err = run("uid-b").unwrap_err();
+        assert_eq!(err, SESSION_COPY_APP_RUNNING);
+        assert_eq!(
+            env.rows_for(WbVariant::Ai, "uid-b").len(),
+            1,
+            "未新增副本行"
+        );
+
+        // 读不到登录态（认证文件缺失）：保守拒绝。
+        std::fs::remove_file(env.paths(WbVariant::Ai).auth_file).unwrap();
+        let err = run("uid-b").unwrap_err();
+        assert_eq!(err, SESSION_COPY_APP_RUNNING);
+
+        // App 未运行：任何目标都放行（登录态缺失也不再拦截）；此时源会话已有
+        // 有效副本，返回 alreadyLinked 而非再次复制。
+        let report = cross_copy_with_probe(
+            &env,
+            WbVariant::Cn,
+            "uid-a",
+            WbVariant::Ai,
+            "uid-b",
+            &["sess-1"],
+            |_| false,
+        )
+        .unwrap();
+        assert!(
+            !report["alreadyLinked"].as_array().unwrap().is_empty(),
+            "{report}"
+        );
+        assert!(report.get("errors").is_none(), "{report}");
+    }
+
+    /// 基础跨档复制（CN → AI）：正文按源工作区同名目录落到目标档，行写目标档、
+    /// 映射行交给客户端，关联组两个成员各记自己的档位。
+    #[test]
+    fn cross_copy_lands_body_row_and_member_variants() {
+        let env = CrossEnv::new("cn-to-ai");
+        env.create_db(WbVariant::Cn, "");
+        env.create_edge_db(WbVariant::Cn);
+        env.create_db(WbVariant::Ai, "");
+        env.create_edge_db(WbVariant::Ai);
+        env.add_session(WbVariant::Cn, "sess-1", "uid-a", "标题一");
+        env.add_body(WbVariant::Cn, "sess-1", &body_text("sess-1"));
+
+        let report = cross_copy(
+            &env,
+            WbVariant::Cn,
+            "uid-a",
+            WbVariant::Ai,
+            "uid-b",
+            &["sess-1"],
+        );
+        assert_eq!(report["sourceVariant"], "cn");
+        assert_eq!(report["targetVariant"], "ai");
+        assert_eq!(report["sourceUid"], "uid-a");
+        assert_eq!(report["targetUid"], "uid-b");
+        let new_id = report["copied"][0]["newId"].as_str().unwrap().to_string();
+        assert_ne!(new_id, "sess-1");
+
+        // 正文：目标档同名工作区目录，id 全量替换；源档不新增文件。
+        let target_body = env.body_path(WbVariant::Ai, &new_id);
+        assert!(target_body.is_file());
+        let text = std::fs::read_to_string(&target_body).unwrap();
+        assert!(text.contains(&new_id));
+        assert!(!text.contains("sess-1"));
+        assert!(!env.body_path(WbVariant::Cn, &new_id).exists());
+
+        assert_eq!(env.rows_for(WbVariant::Ai, "uid-b"), vec![new_id.clone()]);
+        assert_eq!(
+            env.rows_for(WbVariant::Cn, "uid-a"),
+            vec!["sess-1".to_string()]
+        );
+
+        // 不预写映射行：云端登记交接给客户端，两档映射表都不应出现工具写入。
+        assert!(env.mapping_rows(WbVariant::Ai).is_empty());
+        assert!(env.mapping_rows(WbVariant::Cn).is_empty());
+
+        // 关联组：跨档组，两成员各记自己的档位。
+        let store = match session_link::load_store(&env.paths(WbVariant::Ai)) {
+            StoreState::Ready(store) => store,
+            other => panic!("同步记录应为 Ready，实际 {other:?}"),
+        };
+        assert_eq!(store.groups.len(), 1);
+        let group = &store.groups[0];
+        let source_member = session_link::find_member(group, "uid-a", "sess-1").unwrap();
+        assert_eq!(source_member.variant, Some(WbVariant::Cn));
+        let target_member = session_link::find_member(group, "uid-b", &new_id).unwrap();
+        assert_eq!(target_member.variant, Some(WbVariant::Ai));
+    }
+
+    /// 目标档列集合与源档不同（双向缺列）时按目标列取交集：不写 NULL、不报错。
+    #[test]
+    fn cross_copy_uses_target_columns_intersection() {
+        let env = CrossEnv::new("columns");
+        // 源多一列 transport；目标多一列 unread。
+        env.create_db(WbVariant::Cn, ", transport TEXT");
+        env.create_edge_db(WbVariant::Cn);
+        env.create_db(WbVariant::Ai, ", unread INTEGER");
+        env.create_edge_db(WbVariant::Ai);
+        env.add_session(WbVariant::Cn, "sess-1", "uid-a", "标题一");
+        env.add_body(WbVariant::Cn, "sess-1", &body_text("sess-1"));
+
+        let report = cross_copy(
+            &env,
+            WbVariant::Cn,
+            "uid-a",
+            WbVariant::Ai,
+            "uid-b",
+            &["sess-1"],
+        );
+        let new_id = report["copied"][0]["newId"].as_str().unwrap().to_string();
+
+        let conn = Connection::open(env.paths(WbVariant::Ai).workbuddy_db()).unwrap();
+        let (title, cwd, unread): (String, String, Option<i64>) = conn
+            .query_row(
+                "SELECT title, cwd, unread FROM sessions WHERE id = ?1",
+                [&new_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "标题一");
+        assert_eq!(cwd, "/ws/a");
+        // 目标独有列由库默认值补齐（无默认值时 NULL），不因源列结构报错。
+        assert_eq!(unread, None);
+    }
+
+    /// 反向（AI → CN）同路径可用：正文/行/映射落 CN，成员档位正确。
+    #[test]
+    fn cross_copy_ai_to_cn_uses_same_kernel() {
+        let env = CrossEnv::new("ai-to-cn");
+        env.create_db(WbVariant::Ai, "");
+        env.create_edge_db(WbVariant::Ai);
+        env.create_db(WbVariant::Cn, "");
+        env.create_edge_db(WbVariant::Cn);
+        env.add_session(WbVariant::Ai, "sess-ai", "uid-ai", "AI 标题");
+        env.add_body(WbVariant::Ai, "sess-ai", &body_text("sess-ai"));
+
+        let report = cross_copy(
+            &env,
+            WbVariant::Ai,
+            "uid-ai",
+            WbVariant::Cn,
+            "uid-cn",
+            &["sess-ai"],
+        );
+        assert_eq!(report["sourceVariant"], "ai");
+        assert_eq!(report["targetVariant"], "cn");
+        let new_id = report["copied"][0]["newId"].as_str().unwrap().to_string();
+        assert!(env.body_path(WbVariant::Cn, &new_id).is_file());
+        assert_eq!(env.rows_for(WbVariant::Cn, "uid-cn"), vec![new_id.clone()]);
+        assert!(
+            env.mapping_rows(WbVariant::Cn).is_empty(),
+            "复制不得预写映射行"
+        );
+
+        let store = match session_link::load_store(&env.paths(WbVariant::Cn)) {
+            StoreState::Ready(store) => store,
+            other => panic!("同步记录应为 Ready，实际 {other:?}"),
+        };
+        let group = &store.groups[0];
+        assert_eq!(
+            session_link::find_member(group, "uid-ai", "sess-ai")
+                .unwrap()
+                .variant,
+            Some(WbVariant::Ai)
+        );
+        assert_eq!(
+            session_link::find_member(group, "uid-cn", &new_id)
+                .unwrap()
+                .variant,
+            Some(WbVariant::Cn)
+        );
+    }
+
+    /// 同一跨档请求重复执行：第二次复用已有有效副本（alreadyLinked），不写第二个副本。
+    #[test]
+    fn cross_copy_reuses_existing_target_link() {
+        let env = CrossEnv::new("already");
+        env.create_db(WbVariant::Cn, "");
+        env.create_edge_db(WbVariant::Cn);
+        env.create_db(WbVariant::Ai, "");
+        env.create_edge_db(WbVariant::Ai);
+        env.add_session(WbVariant::Cn, "sess-1", "uid-a", "标题一");
+        env.add_body(WbVariant::Cn, "sess-1", &body_text("sess-1"));
+
+        let first = cross_copy(
+            &env,
+            WbVariant::Cn,
+            "uid-a",
+            WbVariant::Ai,
+            "uid-b",
+            &["sess-1"],
+        );
+        let new_id = first["copied"][0]["newId"].as_str().unwrap().to_string();
+        let second = cross_copy(
+            &env,
+            WbVariant::Cn,
+            "uid-a",
+            WbVariant::Ai,
+            "uid-b",
+            &["sess-1"],
+        );
+        assert!(second["copied"].as_array().unwrap().is_empty(), "{second}");
+        assert_eq!(
+            second["alreadyLinked"][0]["sessionId"],
+            new_id.as_str(),
+            "{second}"
+        );
+        assert_eq!(env.rows_for(WbVariant::Ai, "uid-b"), vec![new_id]);
+    }
+
+    /// 跨档操作中断后恢复：源正文与源行从源档（sourceVariant）读取，产物落目标档。
+    #[test]
+    fn cross_recovery_reads_source_from_operation_variant() {
+        let env = CrossEnv::new("recovery");
+        env.create_db(WbVariant::Cn, "");
+        env.create_edge_db(WbVariant::Cn);
+        env.create_db(WbVariant::Ai, "");
+        env.create_edge_db(WbVariant::Ai);
+        env.add_session(WbVariant::Cn, "sess-1", "uid-a", "标题一");
+        env.add_body(WbVariant::Cn, "sess-1", &body_text("sess-1"));
+
+        let ai_paths = env.paths(WbVariant::Ai);
+        // 与生产一致：操作产生于一次复制，关联存储主文件必然已存在（先建空表）。
+        session_link::with_link_store_write(&ai_paths, |_| Ok(())).unwrap();
+        // 手工留下一条 Prepared 阶段的跨档操作（CN → AI），模拟正文写入前中断。
+        session_link::save_operation(
+            &ai_paths,
+            &Operation {
+                version: crate::modules::session_link::OPERATION_VERSION,
+                operation_id: "op-cross".to_string(),
+                kind: "copy".to_string(),
+                variant: WbVariant::Ai,
+                source_variant: Some(WbVariant::Cn),
+                group_id: "g-cross".to_string(),
+                source: OperationMember {
+                    account_id: None,
+                    uid: "uid-a".to_string(),
+                    session_id: "sess-1".to_string(),
+                },
+                target: OperationMember {
+                    account_id: None,
+                    uid: "uid-b".to_string(),
+                    session_id: "new-cross".to_string(),
+                },
+                expected_content_digest: "将在恢复时按源内容刷新".to_string(),
+                expected_record_count: 0,
+                phase: crate::modules::session_link::OpPhase::Prepared,
+                backup: None,
+                lifecycle_version: None,
+                cleanup_state: None,
+                last_error: None,
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .unwrap();
+
+        let report =
+            recover_pending_session_operations_at_with(&ai_paths, WbVariant::Ai, |variant| {
+                env.paths(variant)
+            });
+        assert!(report.needs_recovery.is_empty(), "{report:?}");
+        assert_eq!(report.recovered, vec!["op-cross".to_string()]);
+
+        // 产物全部落到 AI（目标档）。
+        assert!(env.body_path(WbVariant::Ai, "new-cross").is_file());
+        assert_eq!(
+            env.rows_for(WbVariant::Ai, "uid-b"),
+            vec!["new-cross".to_string()]
+        );
+        assert!(
+            env.mapping_rows(WbVariant::Ai).is_empty(),
+            "恢复不得补写映射行"
+        );
+        let store = match session_link::load_store(&ai_paths) {
+            StoreState::Ready(store) => store,
+            other => panic!("同步记录应为 Ready，实际 {other:?}"),
+        };
+        let group = store
+            .groups
+            .iter()
+            .find(|group| group.id == "g-cross")
+            .expect("恢复后应提交关联组");
+        assert_eq!(
+            session_link::find_member(group, "uid-a", "sess-1")
+                .unwrap()
+                .variant,
+            Some(WbVariant::Cn)
+        );
+    }
+
+    /// 跨档预览：复制建组后判 identical；源追加 → fastForward；两边分别追加 → diverge；
+    /// 源行删除 → unknown。内容与标题按成员档位读取（源读 CN、目标读 AI）。
+    #[test]
+    fn cross_preview_verdicts_follow_member_content() {
+        let env = CrossEnv::new("preview");
+        env.create_db(WbVariant::Cn, "");
+        env.create_edge_db(WbVariant::Cn);
+        env.create_db(WbVariant::Ai, "");
+        env.create_edge_db(WbVariant::Ai);
+        env.add_session(WbVariant::Cn, "sess-1", "uid-a", "标题一");
+        env.add_body(WbVariant::Cn, "sess-1", &body_text("sess-1"));
+
+        let source_paths = env.paths(WbVariant::Cn);
+        let target_paths = env.paths(WbVariant::Ai);
+        let source_acc = json!({"id": "acc-uid-a", "uid": "uid-a", "variant": "cn"});
+        let target_acc = json!({"id": "acc-uid-b", "uid": "uid-b", "variant": "ai"});
+        let preview = || {
+            session_links_preview_cross_at(
+                &source_paths,
+                WbVariant::Cn,
+                &source_acc,
+                &target_paths,
+                WbVariant::Ai,
+                &target_acc,
+                |variant| env.paths(variant),
+            )
+            .unwrap()
+        };
+
+        // 复制建组：CN → AI（正文落在目标档同名工作区目录）。
+        let report = cross_copy(
+            &env,
+            WbVariant::Cn,
+            "uid-a",
+            WbVariant::Ai,
+            "uid-b",
+            &["sess-1"],
+        );
+        let new_id = report["copied"][0]["newId"].as_str().unwrap().to_string();
+
+        // 复制完成即一致；报告带两侧档位，标题取自源档。
+        let first = preview();
+        assert_eq!(first["sourceVariant"], "cn");
+        assert_eq!(first["targetVariant"], "ai");
+        assert_eq!(first["storeStatus"], "ready");
+        assert_eq!(first["groups"][0]["verdict"], "identical");
+        assert_eq!(first["groups"][0]["title"], "标题一");
+        assert_eq!(first["groups"][0]["source"]["sessionId"], "sess-1");
+        assert_eq!(first["groups"][0]["target"]["sessionId"], new_id.as_str());
+
+        // 源追加 3 条 → fastForward（extraA=3），给出可执行的 previewToken。
+        append_records(&env.body_path(WbVariant::Cn, "sess-1"), "sess-1", 2, 3);
+        let second = preview();
+        let item = &second["groups"][0];
+        assert_eq!(item["verdict"], "fastForward");
+        assert_eq!(item["extraA"], 3);
+        assert_eq!(item["extraB"], 0);
+        assert_eq!(item["defaultChecked"], true);
+        assert_eq!(item["recordCount"]["source"], 5);
+        assert_eq!(item["recordCount"]["target"], 2);
+        assert!(item["previewToken"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()));
+
+        // 目标追加自己独有的 2 条 → diverge（两边各有独有内容，只能显式覆盖）。
+        append_records(&env.body_path(WbVariant::Ai, &new_id), &new_id, 100, 2);
+        let third = preview();
+        let item = &third["groups"][0];
+        assert_eq!(item["verdict"], "diverge");
+        assert_eq!(item["extraA"], 3);
+        assert_eq!(item["extraB"], 2);
+        assert_eq!(item["availableModes"][0], "overwrite");
+
+        // 源行删除 → 成员失效，判定 unknown 且不可执行。
+        env.delete_session(WbVariant::Cn, "sess-1");
+        let fourth = preview();
+        let item = &fourth["groups"][0];
+        assert_eq!(item["verdict"], "unknown");
+        assert_eq!(item["defaultChecked"], false);
+        assert!(item["availableModes"].as_array().unwrap().is_empty());
+        assert!(item.get("previewToken").is_none());
+    }
+
+    /// 跨档预览入口也覆盖同档组（两个国内版账号）：判定路径一致，报告不带档位字段。
+    #[test]
+    fn cross_preview_supports_same_variant_groups() {
+        let env = CrossEnv::new("preview-same");
+        env.create_db(WbVariant::Cn, "");
+        env.create_edge_db(WbVariant::Cn);
+        env.add_session(WbVariant::Cn, "sess-1", "uid-a", "标题一");
+        env.add_body(WbVariant::Cn, "sess-1", &body_text("sess-1"));
+
+        cross_copy(
+            &env,
+            WbVariant::Cn,
+            "uid-a",
+            WbVariant::Cn,
+            "uid-b",
+            &["sess-1"],
+        );
+
+        let paths = env.paths(WbVariant::Cn);
+        let source_acc = json!({"id": "acc-uid-a", "uid": "uid-a", "variant": "cn"});
+        let target_acc = json!({"id": "acc-uid-b", "uid": "uid-b", "variant": "cn"});
+        let report = session_links_preview_cross_at(
+            &paths,
+            WbVariant::Cn,
+            &source_acc,
+            &paths,
+            WbVariant::Cn,
+            &target_acc,
+            |variant| env.paths(variant),
+        )
+        .unwrap();
+        assert!(report.get("sourceVariant").is_none());
+        assert_eq!(report["groups"][0]["verdict"], "identical");
+    }
+
+    /// 跨档同步的公共准备：CN 源 sess-1 → AI 目标复制建组，返回（环境、源/目标路径、newId）。
+    fn cross_sync_env(name: &str) -> (CrossEnv, SessionPaths, SessionPaths, String) {
+        let env = CrossEnv::new(name);
+        env.create_db(WbVariant::Cn, "");
+        env.create_edge_db(WbVariant::Cn);
+        env.create_db(WbVariant::Ai, "");
+        env.create_edge_db(WbVariant::Ai);
+        env.add_session(WbVariant::Cn, "sess-1", "uid-a", "标题一");
+        env.add_body(WbVariant::Cn, "sess-1", &body_text("sess-1"));
+        let report = cross_copy(
+            &env,
+            WbVariant::Cn,
+            "uid-a",
+            WbVariant::Ai,
+            "uid-b",
+            &["sess-1"],
+        );
+        let new_id = report["copied"][0]["newId"].as_str().unwrap().to_string();
+        let cn_paths = env.paths(WbVariant::Cn);
+        let ai_paths = env.paths(WbVariant::Ai);
+        (env, cn_paths, ai_paths, new_id)
+    }
+
+    /// 跨档同步（fastForward）：源追加后把新增同步到目标，判定回到 identical。
+    #[test]
+    fn cross_sync_fast_forward_catches_target_up() {
+        let (env, cn_paths, ai_paths, new_id) = cross_sync_env("sync-ff");
+        let source_acc = json!({"id": "acc-uid-a", "uid": "uid-a", "variant": "cn"});
+        let target_acc = json!({"id": "acc-uid-b", "uid": "uid-b", "variant": "ai"});
+
+        // 源产生 3 条新增 → 预览给 fastForward + 可执行凭据。
+        append_records(&env.body_path(WbVariant::Cn, "sess-1"), "sess-1", 2, 3);
+        let before = session_links_preview_cross_at(
+            &cn_paths,
+            WbVariant::Cn,
+            &source_acc,
+            &ai_paths,
+            WbVariant::Ai,
+            &target_acc,
+            |variant| env.paths(variant),
+        )
+        .unwrap();
+        let item = &before["groups"][0];
+        assert_eq!(item["verdict"], "fastForward");
+        let selection = SyncSelection {
+            group_id: item["groupId"].as_str().unwrap().to_string(),
+            preview_token: item["previewToken"].as_str().unwrap().to_string(),
+            mode: SyncMode::FastForward,
+        };
+
+        let report = sync_sessions_cross_at(
+            &cross_side(&cn_paths, WbVariant::Cn, "uid-a"),
+            &cross_side(&ai_paths, WbVariant::Ai, "uid-b"),
+            &[selection],
+            |_| false,
+            |variant| env.paths(variant),
+        )
+        .unwrap();
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["synced"][0]["status"], "synced");
+        assert_eq!(report["synced"][0]["mode"], "fastForward");
+
+        // 目标正文追平源（保留自己的 sessionId）；再判定为 identical。
+        let source_text = std::fs::read_to_string(env.body_path(WbVariant::Cn, "sess-1")).unwrap();
+        let target_text = std::fs::read_to_string(env.body_path(WbVariant::Ai, &new_id)).unwrap();
+        assert_eq!(target_text, source_text.replace("sess-1", &new_id));
+
+        let after = session_links_preview_cross_at(
+            &cn_paths,
+            WbVariant::Cn,
+            &source_acc,
+            &ai_paths,
+            WbVariant::Ai,
+            &target_acc,
+            |variant| env.paths(variant),
+        )
+        .unwrap();
+        assert_eq!(after["groups"][0]["verdict"], "identical");
+    }
+
+    /// 跨档同步（overwrite）：冲突经显式覆盖后目标 = 源（目标独有内容被替换）。
+    #[test]
+    fn cross_sync_overwrite_resolves_diverge() {
+        let (env, cn_paths, ai_paths, new_id) = cross_sync_env("sync-overwrite");
+        let source_acc = json!({"id": "acc-uid-a", "uid": "uid-a", "variant": "cn"});
+        let target_acc = json!({"id": "acc-uid-b", "uid": "uid-b", "variant": "ai"});
+
+        append_records(&env.body_path(WbVariant::Cn, "sess-1"), "sess-1", 2, 3);
+        append_records(&env.body_path(WbVariant::Ai, &new_id), &new_id, 100, 2);
+
+        let before = session_links_preview_cross_at(
+            &cn_paths,
+            WbVariant::Cn,
+            &source_acc,
+            &ai_paths,
+            WbVariant::Ai,
+            &target_acc,
+            |variant| env.paths(variant),
+        )
+        .unwrap();
+        let item = &before["groups"][0];
+        assert_eq!(item["verdict"], "diverge");
+        assert_eq!(item["availableModes"][0], "overwrite");
+        let selection = SyncSelection {
+            group_id: item["groupId"].as_str().unwrap().to_string(),
+            preview_token: item["previewToken"].as_str().unwrap().to_string(),
+            mode: SyncMode::Overwrite,
+        };
+
+        let report = sync_sessions_cross_at(
+            &cross_side(&cn_paths, WbVariant::Cn, "uid-a"),
+            &cross_side(&ai_paths, WbVariant::Ai, "uid-b"),
+            &[selection],
+            |_| false,
+            |variant| env.paths(variant),
+        )
+        .unwrap();
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["synced"][0]["mode"], "overwrite");
+
+        let source_text = std::fs::read_to_string(env.body_path(WbVariant::Cn, "sess-1")).unwrap();
+        let target_text = std::fs::read_to_string(env.body_path(WbVariant::Ai, &new_id)).unwrap();
+        assert_eq!(target_text, source_text.replace("sess-1", &new_id));
+        assert!(
+            !target_text.contains("\"index\":100"),
+            "目标独有内容应被覆盖"
+        );
+    }
+
+    /// 跨档同步：预览后源又变化 → 跳过（previewStale），目标零写入。
+    #[test]
+    fn cross_sync_skips_stale_preview() {
+        let (env, cn_paths, ai_paths, new_id) = cross_sync_env("sync-stale");
+        let source_acc = json!({"id": "acc-uid-a", "uid": "uid-a", "variant": "cn"});
+        let target_acc = json!({"id": "acc-uid-b", "uid": "uid-b", "variant": "ai"});
+
+        append_records(&env.body_path(WbVariant::Cn, "sess-1"), "sess-1", 2, 1);
+        let before = session_links_preview_cross_at(
+            &cn_paths,
+            WbVariant::Cn,
+            &source_acc,
+            &ai_paths,
+            WbVariant::Ai,
+            &target_acc,
+            |variant| env.paths(variant),
+        )
+        .unwrap();
+        let item = &before["groups"][0];
+        assert_eq!(item["verdict"], "fastForward");
+        let selection = SyncSelection {
+            group_id: item["groupId"].as_str().unwrap().to_string(),
+            preview_token: item["previewToken"].as_str().unwrap().to_string(),
+            mode: SyncMode::FastForward,
+        };
+
+        // 预览之后源再变化：凭据失效，执行必须跳过并保持目标不变。
+        let target_before = std::fs::read_to_string(env.body_path(WbVariant::Ai, &new_id)).unwrap();
+        append_records(&env.body_path(WbVariant::Cn, "sess-1"), "sess-1", 3, 1);
+        let report = sync_sessions_cross_at(
+            &cross_side(&cn_paths, WbVariant::Cn, "uid-a"),
+            &cross_side(&ai_paths, WbVariant::Ai, "uid-b"),
+            &[selection],
+            |_| false,
+            |variant| env.paths(variant),
+        )
+        .unwrap();
+        assert!(report["synced"].as_array().unwrap().is_empty());
+        assert_eq!(report["skipped"][0]["reasonCode"], "previewStale");
+        let target_after = std::fs::read_to_string(env.body_path(WbVariant::Ai, &new_id)).unwrap();
+        assert_eq!(target_after, target_before);
     }
 
     // ---------------------------------------------------------------------------
@@ -5418,7 +6698,7 @@ mod tests {
         assert_eq!(env.baseline_files(), baselines_before);
     }
 
-    /// 仅目标变化 → ahead：不可勾选、不发凭据，目标正文不变。
+    /// 仅目标变化 → ahead：普通同步不可勾选，但为显式整组统一保留校验凭据。
     #[test]
     fn preview_reports_ahead_when_only_target_changed() {
         let env = ready_env("sync-preview-ahead");
@@ -5435,7 +6715,10 @@ mod tests {
         assert_eq!(group["extraA"], 0);
         assert_eq!(group["extraB"], 5);
         assert_eq!(group["availableModes"], json!([]));
-        assert!(group.get("previewToken").is_none(), "不可勾选的组不发凭据");
+        assert!(
+            group["previewToken"].as_str().is_some(),
+            "显式整组统一需要绑定当前内容"
+        );
         assert!(group["reason"]
             .as_str()
             .unwrap()
@@ -5447,6 +6730,40 @@ mod tests {
             target_body_before
         );
         assert_eq!(env.store().revision, revision_before);
+    }
+
+    #[test]
+    fn explicit_group_unify_can_replace_ahead_but_ordinary_overwrite_cannot() {
+        let env = ready_env("sync-unify-ahead");
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        let target_id = env.first_copy_id(&report);
+        append_records(&env.body_path(&target_id), &target_id, 0, 5);
+        let group = preview(&env, "uid-b")["groups"][0].clone();
+        assert_eq!(group["verdict"], "ahead");
+        assert_eq!(group["availableModes"], json!([]));
+        let group_id = group["groupId"].as_str().unwrap();
+        let token = group["previewToken"].as_str().unwrap();
+
+        let rejected = sync(
+            &env,
+            "uid-b",
+            &[selection(group_id, token, SyncMode::Overwrite)],
+        );
+        assert!(rejected["synced"].as_array().unwrap().is_empty());
+        assert_eq!(rejected["errors"].as_array().unwrap().len(), 1);
+
+        let applied = sync(
+            &env,
+            "uid-b",
+            &[selection(group_id, token, SyncMode::UnifyOverwrite)],
+        );
+        assert_eq!(applied["synced"].as_array().unwrap().len(), 1, "{applied}");
+        let source_text = std::fs::read_to_string(env.body_path("sess-1")).unwrap();
+        let target_text = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
+        assert_eq!(
+            session_link::normalize_jsonl(&source_text, "sess-1").unwrap(),
+            session_link::normalize_jsonl(&target_text, &target_id).unwrap(),
+        );
     }
 
     /// 一方有效成员缺失（失效/被替换）→ 不提供写入动作，记录数按契约给 0 而不是 null。
@@ -5519,7 +6836,7 @@ mod tests {
             skipped["message"]
                 .as_str()
                 .unwrap()
-                .contains("当前账号的内容已变化"),
+                .contains("来源账号的内容已变化"),
             "{skipped}"
         );
         assert_eq!(
@@ -5598,6 +6915,7 @@ mod tests {
                     account_id: None,
                     uid: "uid-c".to_string(),
                     session_id: "sess-c".to_string(),
+                    variant: None,
                     state: MemberState::Active,
                     linked_at: 1,
                     last_synced_at: None,
@@ -6054,16 +7372,18 @@ mod tests {
         let target_body_before = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
         let one = [selection(&group_id, &token, SyncMode::FastForward)];
 
-        // App 运行中 → 拒绝（与复制同一条生命周期保护），不写任何东西。
-        let err = sync_sessions_for_switch_at(
+        // 目标账号不是当前登录账号（auth=uid-a）：App 运行中不再拦截，正常同步（S5 实测口径）。
+        let report = sync_sessions_for_switch_at(
             &env.paths(),
             WbVariant::Cn,
             &env.target("uid-b"),
             &one,
             |_| true,
         )
-        .unwrap_err();
-        assert_eq!(err, SESSION_COPY_APP_RUNNING);
+        .unwrap();
+        assert_eq!(report["synced"].as_array().unwrap().len(), 1);
+        let target_body_after = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
+        assert_ne!(target_body_before, target_body_after, "目标正文已追平");
 
         // 空选择项 → 什么都不做，也不要求关闭 App。
         let report = sync_sessions_for_switch_at(
@@ -6098,9 +7418,10 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("当前账号与目标账号相同"), "{err}");
 
+        // 失败的两条（缺 uid / 同账号）都不应再触碰目标正文。
         assert_eq!(
             std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
-            target_body_before
+            target_body_after
         );
     }
 
@@ -7143,6 +8464,7 @@ mod tests {
                 operation_id: "op-sync-pending".to_string(),
                 kind: OPERATION_KIND_SYNC.to_string(),
                 variant: WbVariant::Cn,
+                source_variant: None,
                 group_id: group_id.clone(),
                 source: OperationMember {
                     account_id: None,
@@ -7200,6 +8522,7 @@ mod tests {
                 operation_id: "op-sync-no-backup".to_string(),
                 kind: OPERATION_KIND_SYNC.to_string(),
                 variant: WbVariant::Cn,
+                source_variant: None,
                 group_id,
                 source: OperationMember {
                     account_id: None,

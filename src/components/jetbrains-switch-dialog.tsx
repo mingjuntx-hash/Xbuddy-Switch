@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { JetbrainsMark } from "@/components/product-marks";
 import * as api from "@/lib/api";
+import { displayName } from "@/lib/account-display";
 import type { AccountMeta, JetbrainsStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -99,7 +100,7 @@ export function JetbrainsSwitchDialog({ open, onOpenChange, account, jetbrainsSt
           </DialogTitle>
           <DialogDescription>
             {account ? (
-              <>把 {account.nickname || account.uid || "该账号"} 设为所选 IDE 的 CodeBuddy 插件登录账号。</>
+              <>把 {displayName(account)} 设为所选 IDE 的 CodeBuddy 插件登录账号。</>
             ) : (
               "选择要写入的 IDE。"
             )}

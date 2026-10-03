@@ -284,10 +284,33 @@ pub struct LinkMember {
     pub account_id: Option<String>,
     pub uid: String,
     pub session_id: String,
+    /// 该副本所属档位（跨档组成员各自不同）。旧存储没有此字段：
+    /// 载入时用组级 `variant` 回填，见 `backfill_member_variants`。
+    #[serde(default)]
+    pub variant: Option<WbVariant>,
     pub state: MemberState,
     pub linked_at: i64,
     #[serde(default)]
     pub last_synced_at: Option<i64>,
+}
+
+/// 成员所属档位：显式保存优先；旧存储（尚未回填）回退组级 `variant`。
+pub fn member_variant(group: &LinkGroup, member: &LinkMember) -> WbVariant {
+    member.variant.unwrap_or(group.variant)
+}
+
+/// 旧存储兼容：成员缺 `variant` 时用组级 `variant` 回填。
+///
+/// 新建成员一律写入显式档位（跨档组必须如此）；仅在 `load_store` 内调用，
+/// 使读取后的存储在身份判定与一致性校验前就具备完整档位信息。
+fn backfill_member_variants(store: &mut LinkStore) {
+    for group in store.groups.iter_mut() {
+        for member in group.members.iter_mut() {
+            if member.variant.is_none() {
+                member.variant = Some(group.variant);
+            }
+        }
+    }
 }
 
 /// 配对基线引用（成员对无序存储，避免同一对出现两条记录）。
@@ -367,11 +390,12 @@ pub enum SyncVerdict {
     Identical,
     /// 目标内容被来源完整包含（目标为来源的严格有序前缀）：默认勾选快进。
     FastForward,
-    /// 来源等于共同基线、目标已变化：仅目标变化，不写目标。
+    /// 仅目标变化（来源等于共同基线），或来源是目标的严格有序前缀：
+    /// 普通同步不写目标；组级统一可显式覆盖。
     Ahead,
     /// 双方都有变化，或来源重写/重排/压缩：默认不勾，可显式覆盖。
     Diverge,
-    /// 成员/文件无效、内容不可验证或缺可验证基线：禁止同步。
+    /// 成员/文件无效、内容不可验证，或双方互不为严格有序前缀且缺可验证基线：禁止同步。
     Unknown,
 }
 
@@ -386,8 +410,7 @@ impl SyncVerdict {
         }
     }
 
-    /// 是否允许用户勾选执行：ahead 由目标侧承担、identical 无需动作，
-    /// unknown 一律禁止（含显式覆盖）。
+    /// 普通同步是否允许勾选；组级统一的显式覆盖独立于此。
     pub fn is_actionable(self) -> bool {
         matches!(self, SyncVerdict::FastForward | SyncVerdict::Diverge)
     }
@@ -397,6 +420,7 @@ impl SyncVerdict {
         match mode {
             SyncMode::FastForward => self == SyncVerdict::FastForward,
             SyncMode::Overwrite => self == SyncVerdict::Diverge,
+            SyncMode::UnifyOverwrite => self == SyncVerdict::Ahead,
         }
     }
 
@@ -418,6 +442,8 @@ pub enum SyncMode {
     FastForward,
     /// 用户显式选择的覆盖：必须仍为有效可比较的冲突。
     Overwrite,
+    /// 用户选择整组保留来源副本时，明确覆盖仅目标有改动的副本。
+    UnifyOverwrite,
 }
 
 impl SyncMode {
@@ -425,6 +451,7 @@ impl SyncMode {
         match self {
             SyncMode::FastForward => "fastForward",
             SyncMode::Overwrite => "overwrite",
+            SyncMode::UnifyOverwrite => "unifyOverwrite",
         }
     }
 
@@ -433,6 +460,7 @@ impl SyncMode {
         match raw.trim() {
             "fastForward" => Ok(SyncMode::FastForward),
             "overwrite" => Ok(SyncMode::Overwrite),
+            "unifyOverwrite" => Ok(SyncMode::UnifyOverwrite),
             other => Err(format!("未知的同步模式：{other}")),
         }
     }
@@ -499,15 +527,26 @@ fn multiset_counts(source: &[String], target: &[String]) -> (usize, usize, usize
     (source.len() - common, target.len() - common, common)
 }
 
+/// 镜像前缀（目标已完整包含来源）的 ahead 文案：本次没有可写内容，并给出目标多出的条数。
+fn mirror_ahead_reason(counts: (usize, usize, usize)) -> String {
+    format!(
+        "目标账号已包含当前账号的全部内容，另多出 {} 条，本次不会同步过去",
+        counts.1
+    )
+}
+
 /// 判定来源 A 与目标 B 能否同步（design §3.2，顺序不可调换）。
 ///
 /// 1. 成员/文件无效或内容不可验证 → [`SyncVerdict::Unknown`]；
 /// 2. A 与 B 有序一致 → [`SyncVerdict::Identical`]；
 /// 3. B 是 A 的严格有序前缀 → [`SyncVerdict::FastForward`]（不依赖基线，
 ///    对齐 git fast-forward 的 ancestor 语义：目标内容被来源完整包含，追加同步零覆盖）；
-/// 4. 无可验证共同基线 → [`SyncVerdict::Unknown`]；
+/// 4. 无可验证共同基线：A 是 B 的严格有序前缀 → [`SyncVerdict::Ahead`]（目标已完整包含来源，
+///    普通同步没有可写内容；同样不依赖基线、不授权任何写入），其余 → [`SyncVerdict::Unknown`]；
 /// 5. A 等于基线、B 已变化 → [`SyncVerdict::Ahead`]；
-/// 6. 其余（双方变化、来源重写/重排/压缩）→ [`SyncVerdict::Diverge`]。
+/// 6. A 是 B 的严格有序前缀、B 已偏离基线 → [`SyncVerdict::Ahead`]（镜像规则；B 恰好停在
+///    基线属于来源侧被删减/回滚，保持下一条的显式覆盖入口）；
+/// 7. 其余（双方变化、来源重写/重排/压缩）→ [`SyncVerdict::Diverge`]。
 ///
 /// 纯函数：不读文件、不写文件、无时间依赖。
 pub fn decide_sync(
@@ -555,10 +594,18 @@ pub fn decide_sync(
         return SyncDecision::decide(
             SyncVerdict::FastForward,
             counts,
-            format!("目标账号没有独有改动，当前账号新增 {added} 条，可以直接同步"),
+            format!("目标账号没有独有改动，来源账号新增 {added} 条，可以直接同步"),
         );
     }
     let Some(record) = baseline.ready() else {
+        // 目标已完整包含来源（A ⊊ B 的镜像）：普通同步没有可写内容，
+        // 与祖先快进同一原则，不依赖基线即可判定，且不授权任何写入。
+        if is_strict_ordered_extension(
+            &source.normalized.line_digests,
+            &target.normalized.line_digests,
+        ) {
+            return SyncDecision::decide(SyncVerdict::Ahead, counts, mirror_ahead_reason(counts));
+        }
         return SyncDecision::unknown(
             baseline
                 .unusable_reason()
@@ -571,6 +618,15 @@ pub fn decide_sync(
             counts,
             format!("只有目标账号新增 {} 条，这次不会同步过去", counts.1),
         );
+    }
+    // A 是 B 的严格有序前缀（目标已完整包含来源）：本次没有可写内容 → ahead。
+    // B 恰好停在基线 → 是来源侧被删减/回滚，维持 diverge 的显式覆盖入口。
+    if is_strict_ordered_extension(
+        &source.normalized.line_digests,
+        &target.normalized.line_digests,
+    ) && target.normalized.line_digests != record.line_digests
+    {
+        return SyncDecision::decide(SyncVerdict::Ahead, counts, mirror_ahead_reason(counts));
     }
     SyncDecision::decide(
         SyncVerdict::Diverge,
@@ -591,6 +647,11 @@ pub struct Operation {
     /// `copy`（第一步）／`sync`（第二步预留）。
     pub kind: String,
     pub variant: WbVariant,
+    /// 源档位：跨档复制时与 [`Self::variant`]（目标档）不同；同档与旧记录缺省为 `None`。
+    ///
+    /// 恢复时据此解析源档数据根（正文与源行读取），旧记录一律按同档处理。
+    #[serde(default)]
+    pub source_variant: Option<WbVariant>,
     /// 目标组 id：新建组时在写入前预分配，恢复时复用同一个组。
     pub group_id: String,
     pub source: OperationMember,
@@ -832,6 +893,15 @@ pub fn try_acquire_variant_ops_lock(
         .map_err(|error| error.message(VARIANT_OPS_LOCK_NAME))
 }
 
+/// Namespace-wide operation lock for IDE/extension stores shared across WorkBuddy variants.
+/// The caller holds it across duplicate checks, copy/sync, and link registration.
+pub fn try_acquire_client_ops_lock(paths: &SessionPaths) -> Result<FileLock, String> {
+    try_lock_file(&paths.client_ops_lock_file()).map_err(|error| match error {
+        LockError::Busy => "该客户端正在执行其它会话操作，请稍后重试".to_string(),
+        LockError::Unavailable(reason) => format!("无法建立客户端会话操作锁：{reason}"),
+    })
+}
+
 fn acquire_link_store_lock(paths: &SessionPaths) -> Result<FileLock, String> {
     let path = paths.link_store_lock_file();
     for _ in 0..STORE_LOCK_RETRY {
@@ -909,7 +979,7 @@ pub fn load_store(paths: &SessionPaths) -> StoreState {
         }
         Err(error) => return StoreState::Unavailable(format!("同步记录无法读取：{error}")),
     };
-    let store = match serde_json::from_str::<LinkStore>(&text) {
+    let mut store = match serde_json::from_str::<LinkStore>(&text) {
         Ok(store) => store,
         Err(_) => {
             return StoreState::Unavailable("同步记录已损坏，原文件已保留".to_string());
@@ -921,6 +991,8 @@ pub fn load_store(paths: &SessionPaths) -> StoreState {
             store.version, LINK_STORE_VERSION
         ));
     }
+    // 旧存储兼容：成员缺 `variant` 时用组级 `variant` 回填（跨档组成员显式保存）。
+    backfill_member_variants(&mut store);
     if let Err(reason) = validate_store(&store) {
         return StoreState::Unavailable(format!("同步记录内容不一致：{reason}"));
     }
@@ -929,7 +1001,7 @@ pub fn load_store(paths: &SessionPaths) -> StoreState {
 
 /// 不变量校验（写入前与读取后都执行）：
 /// - 组 id 唯一；
-/// - 同一 (variant, uid, sessionId) 只属于一个组；
+/// - 同一 (variant, uid, sessionId) 只属于一个组（成员档位取 `member_variant`）；
 /// - 每组每个账号至多一个 active 成员；
 /// - 配对基线双方都在组内且不重复。
 pub fn validate_store(store: &LinkStore) -> Result<(), String> {
@@ -946,7 +1018,7 @@ pub fn validate_store(store: &LinkStore) -> Result<(), String> {
                 return Err(format!("成员记录重复：{}", member.member_id));
             }
             let identity = (
-                group.variant.as_str(),
+                member_variant(group, member).as_str(),
                 member.uid.as_str(),
                 member.session_id.as_str(),
             );
@@ -1023,7 +1095,7 @@ pub fn with_link_store_write<T>(
     Ok(outcome)
 }
 
-/// 按 (variant, uid, sessionId) 查找所属组（身份唯一归组）。
+/// 按 (variant, uid, sessionId) 查找所属组（身份唯一归组；成员档位取 `member_variant`）。
 pub fn find_group_for_identity<'a>(
     store: &'a LinkStore,
     variant: WbVariant,
@@ -1031,11 +1103,11 @@ pub fn find_group_for_identity<'a>(
     session_id: &str,
 ) -> Option<&'a LinkGroup> {
     store.groups.iter().find(|group| {
-        group.variant == variant
-            && group
-                .members
-                .iter()
-                .any(|member| member.uid == uid && member.session_id == session_id)
+        group.members.iter().any(|member| {
+            member_variant(group, member) == variant
+                && member.uid == uid
+                && member.session_id == session_id
+        })
     })
 }
 
@@ -1406,7 +1478,7 @@ pub fn verify_preview(preview: &PreviewToken, live: &PreviewBinding) -> Vec<Stri
         stale.push("会话的关联关系或同步记录已变化".to_string());
     }
     if expected.source != live.source {
-        stale.push("当前账号的内容已变化".to_string());
+        stale.push("来源账号的内容已变化".to_string());
     }
     if expected.target != live.target {
         stale.push("目标账号的内容已变化".to_string());
@@ -1589,6 +1661,7 @@ mod tests {
             account_id: None,
             uid: uid.to_string(),
             session_id: session_id.to_string(),
+            variant: None,
             state,
             linked_at: 1,
             last_synced_at: None,
@@ -1611,6 +1684,7 @@ mod tests {
             operation_id: id.to_string(),
             kind: "copy".to_string(),
             variant: WbVariant::Cn,
+            source_variant: None,
             group_id: "g-1".to_string(),
             source: OperationMember {
                 account_id: None,
@@ -1981,6 +2055,110 @@ mod tests {
             groups,
         };
         serde_json::to_string_pretty(&store).unwrap()
+    }
+
+    /// 旧存储（成员没有 `variant` 字段）载入时用组级档位回填，行为与改造前一致。
+    #[test]
+    fn load_backfills_member_variant_from_group() {
+        let dir = TempDir::new("member-variant-backfill");
+        let paths = temp_paths(&dir);
+        std::fs::create_dir_all(&paths.store_root).unwrap();
+
+        // 手工写入"旧版"存储：AI 档位的组，成员没有 variant 字段。
+        let legacy = serde_json::json!({
+            "version": LINK_STORE_VERSION,
+            "revision": 3,
+            "groups": [{
+                "id": "g-legacy",
+                "variant": "ai",
+                "createdAt": 1,
+                "members": [{
+                    "memberId": "m-1",
+                    "uid": "uid-a",
+                    "sessionId": "sess-1",
+                    "state": "active",
+                    "linkedAt": 1
+                }],
+                "pairBases": []
+            }]
+        });
+        std::fs::write(paths.session_links_file(), legacy.to_string()).unwrap();
+
+        let StoreState::Ready(store) = load_store(&paths) else {
+            panic!("旧存储应当可读（成员档位由组级回填）");
+        };
+        let group = &store.groups[0];
+        assert_eq!(group.members[0].variant, Some(WbVariant::Ai));
+        assert_eq!(member_variant(group, &group.members[0]), WbVariant::Ai);
+    }
+
+    /// 跨档组：成员各自保存档位；身份查找与一致性校验按成员档位匹配。
+    #[test]
+    fn cross_variant_group_members_keep_own_variant() {
+        let mut cn = member("uid-cn", "sess-cn", MemberState::Active);
+        cn.variant = Some(WbVariant::Cn);
+        let mut ai = member("uid-ai", "sess-ai", MemberState::Active);
+        ai.variant = Some(WbVariant::Ai);
+        let store = LinkStore {
+            version: LINK_STORE_VERSION,
+            revision: 1,
+            groups: vec![group_with_members("g-cross", vec![cn, ai])],
+        };
+
+        validate_store(&store).expect("跨档组应通过一致性校验");
+        assert!(find_group_for_identity(&store, WbVariant::Ai, "uid-ai", "sess-ai").is_some());
+        assert!(find_group_for_identity(&store, WbVariant::Cn, "uid-cn", "sess-cn").is_some());
+        // 身份必须带档位：拿另一档身份查同一成员不命中。
+        assert!(find_group_for_identity(&store, WbVariant::Cn, "uid-ai", "sess-ai").is_none());
+        assert!(find_group_for_identity(&store, WbVariant::Ai, "uid-cn", "sess-cn").is_none());
+    }
+
+    /// 显式档位随存储往返保留（写回后重新载入仍是成员自己的档位）。
+    /// 旧版操作记录（没有 `sourceVariant` 字段）可正常载入：一律按同档处理。
+    #[test]
+    fn legacy_operation_without_source_variant_deserializes() {
+        let legacy = serde_json::json!({
+            "version": OPERATION_VERSION,
+            "operationId": "op-legacy",
+            "kind": "copy",
+            "variant": "cn",
+            "groupId": "g-1",
+            "source": {"uid": "uid-a", "sessionId": "sess-1"},
+            "target": {"uid": "uid-b", "sessionId": "sess-b"},
+            "expectedContentDigest": "d",
+            "expectedRecordCount": 1,
+            "phase": "prepared",
+            "backup": null,
+            "createdAt": 1,
+            "updatedAt": 1
+        });
+        let operation: Operation = serde_json::from_value(legacy).unwrap();
+        assert_eq!(operation.source_variant, None);
+        assert_eq!(operation.variant, WbVariant::Cn);
+    }
+
+    #[test]
+    fn explicit_member_variant_round_trips() {
+        let dir = TempDir::new("member-variant-roundtrip");
+        let paths = temp_paths(&dir);
+        let mut ai = member("uid-ai", "sess-ai", MemberState::Active);
+        ai.variant = Some(WbVariant::Ai);
+        let mut cn = member("uid-cn", "sess-cn", MemberState::Active);
+        cn.variant = Some(WbVariant::Cn);
+        with_link_store_write(&paths, |store| {
+            store
+                .groups
+                .push(group_with_members("g-cross", vec![ai, cn]));
+            Ok(())
+        })
+        .unwrap();
+
+        let StoreState::Ready(store) = load_store(&paths) else {
+            panic!("写回后应可重新载入");
+        };
+        let members = &store.groups[0].members;
+        assert_eq!(members[0].variant, Some(WbVariant::Ai));
+        assert_eq!(members[1].variant, Some(WbVariant::Cn));
     }
 
     #[test]
@@ -2478,8 +2656,9 @@ mod tests {
         );
     }
 
-    /// 反向前缀不得判快进（回归保护）：A 是 B 的严格前缀（目标领先）时前缀规则不适用，
-    /// 只有目标变化 → 仍是 ahead；无基线时同样不授权写入 → 仍是 unknown。
+    /// 反向前缀不得判快进（回归保护）：A 是 B 的严格前缀（目标领先）时前缀规则不适用。
+    /// 来源等于基线 → 原有文案的 ahead；无基线时镜像规则同样判 ahead（口径 A：
+    /// 镜像关系不依赖基线，改造前无基线回落 unknown），两种情形都不授权任何写入。
     #[test]
     fn ahead_stays_when_target_extends_source() {
         let source = records(5, 0);
@@ -2502,22 +2681,82 @@ mod tests {
         );
         assert_eq!(
             decision.verdict,
-            SyncVerdict::Unknown,
-            "反向前缀不构成祖先关系，无基线时不得写入"
+            SyncVerdict::Ahead,
+            "镜像前缀不依赖基线，无基线时同样判 ahead 且不得写入"
+        );
+        assert!(!decision.default_checked);
+        assert!(decision.verdict.available_modes().is_empty());
+        assert_eq!(decision.extra_a, 0);
+        assert_eq!(decision.extra_b, 4);
+    }
+
+    /// 镜像前缀 + 有基线 + 目标已偏离基线（本机复现态：来源 7 条 ⊊ 目标 9 条、配对基线 4 条）
+    /// → ahead，本次没有可写内容（改造前落入兜底 diverge，会给出把目标新记录回滚掉的覆盖入口）。
+    #[test]
+    fn ahead_when_source_is_ordered_prefix_of_target_with_baseline() {
+        let baseline = records(4, 0);
+        let source = records(7, 0);
+        let target = records(9, 0);
+        let decision = decide_sync(
+            &content_from(&source),
+            &content_from(&target),
+            &BaselineState::Ready(baseline_from(&baseline)),
+        );
+        assert_eq!(decision.verdict, SyncVerdict::Ahead);
+        assert!(!decision.default_checked);
+        assert!(decision.verdict.available_modes().is_empty());
+        assert_eq!(decision.extra_a, 0);
+        assert_eq!(decision.extra_b, 2);
+        assert_eq!(decision.common, 7);
+        assert!(
+            decision.reason.contains("已包含") && decision.reason.contains("2 条"),
+            "{}",
+            decision.reason
         );
     }
 
-    /// 双方都变化 → diverge：默认不勾，但可显式覆盖。
+    /// 镜像前缀不依赖基线：无基线 / 基线不可验证时，A 是 B 的严格有序前缀同样判 ahead
+    /// （改造前为 unknown；两者都不授权任何写入，只是提示更准确）。
+    #[test]
+    fn ahead_without_baseline_when_source_is_ordered_prefix_of_target() {
+        let source = records(5, 0);
+        let target = records(9, 0);
+        for baseline in [
+            BaselineState::Missing,
+            BaselineState::Unverifiable("上次同步的记录缺失或已损坏".to_string()),
+        ] {
+            let decision = decide_sync(&content_from(&source), &content_from(&target), &baseline);
+            assert_eq!(decision.verdict, SyncVerdict::Ahead, "{baseline:?}");
+            assert!(!decision.default_checked);
+            assert!(decision.verdict.available_modes().is_empty());
+            assert_eq!(decision.extra_a, 0);
+            assert_eq!(decision.extra_b, 4);
+            assert!(
+                decision.reason.contains("已包含") && decision.reason.contains("4 条"),
+                "{}",
+                decision.reason
+            );
+        }
+    }
+
+    /// 双方都变化、且互不为前缀（真分叉）→ diverge：默认不勾，但可显式覆盖。
     #[test]
     fn verdict_diverge_when_both_sides_changed() {
         let base = records(5, 0);
+        // 目标写的是另一批新增记录：与来源的尾部互不相同，任一侧都不是对方的前缀。
+        let target = format!("{}{}", records(5, 0), records(5, 100));
         let decision = decide_sync(
             &content_from(&records(7, 0)),
-            &content_from(&records(10, 0)),
+            &content_from(&target),
             &BaselineState::Ready(baseline_from(&base)),
         );
         assert_eq!(decision.verdict, SyncVerdict::Diverge);
         assert!(!decision.default_checked);
+        assert_eq!(
+            decision.extra_a, 2,
+            "真分叉：来源尾部独有，不得被镜像前缀吞掉"
+        );
+        assert_eq!(decision.extra_b, 5, "真分叉：目标尾部独有");
         assert_eq!(
             decision.verdict.available_modes(),
             vec![SyncMode::Overwrite]
@@ -2555,7 +2794,7 @@ mod tests {
         assert_eq!(target_rewritten.verdict, SyncVerdict::Ahead);
     }
 
-    /// 相同多重集、顺序不同 → 不得判快进（extraB 为 0 也不代表安全）。
+    /// 相同多重集、顺序不同 → 不得判快进 / ahead（extraB 为 0 也不代表安全）。
     #[test]
     fn verdict_diverge_for_same_multiset_in_different_order() {
         let base_order = vec![0usize, 1, 2, 3];
@@ -2568,8 +2807,28 @@ mod tests {
         );
         assert_eq!(decision.verdict, SyncVerdict::Diverge);
         assert!(!decision.default_checked);
+        assert_ne!(
+            decision.verdict,
+            SyncVerdict::Ahead,
+            "重排后的等价多重集不得判 ahead"
+        );
         assert_eq!(decision.extra_a, 0, "多重集相同：差集为 0 只是解释信息");
         assert_eq!(decision.extra_b, 0);
+        assert_eq!(decision.common, 4);
+
+        // 目标另有新增（多重集包含来源，但顺序被重排、目标已偏离基线）：镜像分支只认有序前缀，
+        // 不得按多重集包含判 ahead。
+        let target = records_in_order(&[0, 1, 2, 3, 100]);
+        let decision = decide_sync(
+            &content_from(&source),
+            &content_from(&target),
+            &BaselineState::Ready(baseline_from(&base)),
+        );
+        assert_eq!(decision.verdict, SyncVerdict::Diverge);
+        assert_ne!(decision.verdict, SyncVerdict::Ahead);
+        assert!(!decision.verdict.allows(SyncMode::FastForward));
+        assert_eq!(decision.extra_a, 0);
+        assert_eq!(decision.extra_b, 1);
         assert_eq!(decision.common, 4);
     }
 
@@ -2705,6 +2964,9 @@ mod tests {
         assert!(SyncVerdict::FastForward.allows(SyncMode::FastForward));
         assert!(!SyncVerdict::FastForward.allows(SyncMode::Overwrite));
         assert!(SyncVerdict::Diverge.allows(SyncMode::Overwrite));
+        assert!(SyncVerdict::Ahead.allows(SyncMode::UnifyOverwrite));
+        assert!(!SyncVerdict::Diverge.allows(SyncMode::UnifyOverwrite));
+        assert!(!SyncVerdict::Unknown.allows(SyncMode::UnifyOverwrite));
         for verdict in [
             SyncVerdict::Unknown,
             SyncVerdict::Ahead,
@@ -2730,6 +2992,11 @@ mod tests {
                 &ready,
             ),
             decide_sync(
+                &content_from(&records(7, 0)),
+                &content_from(&format!("{}{}", records(5, 0), records(5, 100))),
+                &ready,
+            ),
+            decide_sync(
                 &content_from(&base),
                 &content_from(&base),
                 &BaselineState::Missing,
@@ -2742,7 +3009,7 @@ mod tests {
                 decision.reason
             );
         }
-        for decision in &decisions[..4] {
+        for decision in &decisions[..5] {
             assert!(decision.reason.contains("条"), "{}", decision.reason);
         }
     }
@@ -2928,7 +3195,7 @@ mod tests {
                 },
             ),
             (
-                "当前账号",
+                "来源账号",
                 PreviewBinding {
                     source: PreviewMemberBinding {
                         raw_digest: "changed".to_string(),

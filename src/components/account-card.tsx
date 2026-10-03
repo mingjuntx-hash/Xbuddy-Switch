@@ -1,4 +1,4 @@
-import { ArrowRight, CalendarCheck2, CalendarDays, CalendarOff, Check, CircleCheck, Clock3, Coins, Ellipsis, Gauge, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, StickyNote, Trash2 } from "lucide-react";
+import { ArrowRight, CalendarCheck2, CalendarDays, CalendarOff, Check, CircleCheck, Clock3, Coins, Ellipsis, Gauge, Info, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, StickyNote, Trash2 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 
 import { AccountNoteChip, accountNote } from "@/components/account-note-chip";
@@ -17,24 +17,11 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CodeBuddyCnIdeMark, CodeBuddyMark, JetbrainsMark, VscodeExtMark, WorkBuddyMark } from "@/components/product-marks";
 import type { ToolId } from "@/lib/supported-tools";
 import { cn } from "@/lib/utils";
+import { accountIdentity, displayName } from "@/lib/account-display";
+import { avatarTone } from "@/lib/avatar-tone";
 import { creditResourceName } from "@/lib/credit-package-names";
 import { demoModeEnabled } from "@/lib/demo-mode";
 import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, TravelStatus } from "@/lib/types";
-
-const AVATAR_TONES = [
-  "bg-emerald-100 text-emerald-800",
-  "bg-violet-100 text-violet-800",
-  "bg-sky-100 text-sky-800",
-  "bg-amber-100 text-amber-800",
-  "bg-rose-100 text-rose-800",
-  "bg-teal-100 text-teal-800",
-] as const;
-
-function avatarTone(name: string) {
-  let hash = 0;
-  for (let i = 0; i < name.length; i += 1) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
-  return AVATAR_TONES[hash % AVATAR_TONES.length];
-}
 
 function formatCredits(value: number): string {
   if (!Number.isFinite(value)) return "—";
@@ -87,15 +74,6 @@ function creditResources(credit?: CreditExpiry): CreditResource[] {
       return leftExpiry === rightExpiry ? left.index - right.index : leftExpiry - rightExpiry;
     })
     .map(({ resource }) => resource);
-}
-
-function accountIdentity(account: AccountMeta): string {
-  if (account.email) {
-    const [local, domain] = account.email.split("@");
-    if (!domain) return account.email;
-    return `${local.slice(0, 1)}${"*".repeat(Math.max(3, local.length - 1))}@${domain}`;
-  }
-  return account.uid ? `UID · ${account.uid}` : `ID · ${account.id}`;
 }
 
 const chipClass = "rounded-md px-1.5 py-0 text-[11px] font-medium";
@@ -288,6 +266,8 @@ interface Props {
   onEditNote?: (a: AccountMeta) => void;
   onCheckin?: (a: AccountMeta) => void;
   onRefresh?: (a: AccountMeta) => void;
+  /** 打开「账号信息」弹框（查看信息、编辑备注、选择显示字段）。 */
+  onShowInfo?: (a: AccountMeta) => void;
   onSwitch?: (a: AccountMeta) => void;
   todayCheckedIn?: boolean;
   /** 单账号参与许可，独立于全局开关；undefined 表示配置尚未加载。 */
@@ -432,7 +412,7 @@ function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?:
   );
 }
 
-export function AccountCard({ account, onDelete, onEditNote, onCheckin, onRefresh, onSwitch, todayCheckedIn, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, jetbrainsInstalled, jetbrainsPluginInstalled, jetbrainsAvailable, jetbrainsActive, jetbrainsBusy, jetbrainsLoading, onSwitchJetbrains, enabledTools, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onEditNote, onCheckin, onRefresh, onShowInfo, onSwitch, todayCheckedIn, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, jetbrainsInstalled, jetbrainsPluginInstalled, jetbrainsAvailable, jetbrainsActive, jetbrainsBusy, jetbrainsLoading, onSwitchJetbrains, enabledTools, featuresDisabled = true, compact = false }: Props) {
   /** 支持工具开关：关闭的端整块不渲染（缺省视为开启）。 */
   const toolEnabled = (id: ToolId) => enabledTools?.[id] !== false;
   const [resourcesOpen, setResourcesOpen] = useState(false);
@@ -446,7 +426,7 @@ export function AccountCard({ account, onDelete, onEditNote, onCheckin, onRefres
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
   }, [rateLimits]);
-  const name = account.nickname || account.uid || "未命名账号";
+  const name = displayName(account);
   const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
   const avatarClass = avatarTone(name);
   const note = accountNote(account);
@@ -563,41 +543,44 @@ export function AccountCard({ account, onDelete, onEditNote, onCheckin, onRefres
         </div>
 
         <div className={cn("absolute z-20", compact ? "right-2.5 top-1/2 -translate-y-1/2" : "right-3.5 top-3.5")}>
-          {demoModeEnabled ? (
-            <DemoAction>
+          {/* 演示模式只保留「账号信息」（纯本地查看 / 备注），写操作菜单项不渲染。 */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
               <Button variant="ghost" size="icon" className={cn("rounded-lg text-muted-foreground hover:text-foreground", compact ? "size-7" : "size-8")} aria-label={`管理账号 ${name}`} title="更多账号操作">
                 <Ellipsis />
               </Button>
-            </DemoAction>
-          ) : (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon" className={cn("rounded-lg text-muted-foreground hover:text-foreground", compact ? "size-7" : "size-8")} aria-label={`管理账号 ${name}`} title="更多账号操作">
-                  <Ellipsis />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-40">
-                {/* 备注放在最上面并独立分组：它是账号自身的标识信息，与下面的刷新/签到等操作不同类。 */}
-                <DropdownMenuItem disabled={!onEditNote} onSelect={() => onEditNote?.(account)}>
-                  <StickyNote />
-                  {note ? "编辑备注" : "添加备注"}
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-40">
+              {/* 备注放在最上面并独立分组：它是账号自身的标识信息，与下面的刷新/签到等操作不同类。
+                  纯本地操作，演示模式下也允许（与上游「账号信息」一致的定位）。 */}
+              <DropdownMenuItem disabled={!onEditNote} onSelect={() => onEditNote?.(account)}>
+                <StickyNote />
+                {note ? "编辑备注" : "添加备注"}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              {!demoModeEnabled && (
                 <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
                   <RefreshCw />刷新 Token
                 </DropdownMenuItem>
-                {onCheckin && todayCheckedIn !== true && (
-                  <DropdownMenuItem disabled={featuresDisabled || !onCheckin} onSelect={() => onCheckin?.(account)}>
-                    <CircleCheck />手动签到
-                  </DropdownMenuItem>
-                )}
-                <DropdownMenuSeparator />
-                <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
-                  <Trash2 />删除账号
+              )}
+              <DropdownMenuItem disabled={featuresDisabled || !onShowInfo} onSelect={() => onShowInfo?.(account)}>
+                <Info />账号信息
+              </DropdownMenuItem>
+              {!demoModeEnabled && onCheckin && todayCheckedIn !== true && (
+                <DropdownMenuItem disabled={featuresDisabled || !onCheckin} onSelect={() => onCheckin?.(account)}>
+                  <CircleCheck />手动签到
                 </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
+              )}
+              {!demoModeEnabled && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
+                    <Trash2 />删除账号
+                  </DropdownMenuItem>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
 
         {/* 紧凑模式默认开启、是最常见的形态：一行里已经排着账号名、状态 chip 和一整排工具图标按钮，

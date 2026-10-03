@@ -43,6 +43,8 @@ export interface PendingRequest {
   text: string;
   questions: PendingQuestion[];
   ts: number;
+  /** Async Codex questions only; omitted for every other wait. */
+  optional?: true;
 }
 
 export interface Session {

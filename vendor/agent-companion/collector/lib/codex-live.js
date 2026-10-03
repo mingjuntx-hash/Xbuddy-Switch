@@ -1,4 +1,5 @@
 import { isInternalCodexPrompt } from '../../src/monitor/session-visibility.js';
+import { question, questionDetails, questionReplyIds } from './codex.js';
 // Codex sessions are driven exclusively by lifecycle hooks.
 import fs from 'node:fs/promises';
 import { createHash } from 'node:crypto';
@@ -107,14 +108,27 @@ export class CodexLivePoller {
     const emit = ev => this.hub.ingest({source:'codex',sessionId:h.sessionId,cwd:state.cwd,roundId:round,ts:h.ts,...ev});
     if (!prev || begins) emit({type:'start'});
     const command = h.input.command == null ? null : createHash('sha256').update(JSON.stringify(h.input.command)).digest('hex');
-    // Only synchronous questions block the turn; async prompts are ordinary steps.
-    const isQuestion = /(?:^|__|\.)(request_user_input|AskUserQuestion|ask_user_question|RequestUserInput)$/.test(h.tool);
+    // Async questions wait like synchronous ones; only their own completion
+    // must not clear them.
+    const isQuestion = /(?:^|__|\.)(request_user_input|request_user_input_async|AskUserQuestion|ask_user_question|RequestUserInput)$/.test(h.tool);
     if (h.event === 'UserPromptSubmit') {
-      if(h.prompt) emit({type:'meta',title:h.prompt.slice(0,240)});
+      if (h.prompt.startsWith('<send_user_message_question_reply>')) {
+        // Answers clear their exact call and never become a session title.
+        for (const callId of questionReplyIds(h.prompt)) emit({type:'resolve',callId});
+      } else if (h.prompt && !h.prompt.startsWith('<')) {
+        // Real prompts clear Hub optional waits, not just the per-round call
+        // map: PostToolUse marks async calls resolved, and that map is then
+        // pruned, while the question can still be pending.
+        const ids = (this.hub.sessions.get(`codex:${h.sessionId}`)?.pending || [])
+          .filter(item => item.optional === true).map(item => item.id).filter(Boolean);
+        for (const callId of ids) emit({type:'resolve',callId});
+        emit({type:'meta',title:h.prompt.slice(0,240)});
+      }
     }
     if (h.event === 'PreToolUse' && h.callId && !state.calls.get(h.callId)?.resolved) {
-      state.calls.set(h.callId,{tool:h.tool,command,resolved:false,async:h.tool.endsWith('request_user_input_async'),ts:h.ts});
-      if (isQuestion) emit({type:'wait',callId:h.callId,tool:h.tool,text:'需要你确认'});
+      const optional = h.tool.endsWith('request_user_input_async');
+      state.calls.set(h.callId,{tool:h.tool,command,resolved:false,async:optional,ts:h.ts});
+      if (isQuestion) emit({type:'wait',callId:h.callId,tool:h.tool,text:question(h.input),questions:questionDetails(h.input),...(optional?{optional:true}:{})});
       else emit({type:'step',eventId:h.callId,label:h.tool});
     }
     if (h.event === 'PermissionRequest') {

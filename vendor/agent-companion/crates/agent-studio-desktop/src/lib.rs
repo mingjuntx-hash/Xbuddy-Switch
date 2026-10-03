@@ -2,6 +2,8 @@ mod hit_test;
 mod integration_folder;
 #[cfg(target_os = "macos")]
 mod background_cursor;
+#[cfg(target_os = "macos")]
+mod panel;
 mod rail_settings;
 mod session;
 use agent_studio_runtime::Client;
@@ -434,17 +436,26 @@ fn create_rail(app: &tauri::AppHandle, config: &Config) -> Result<(), Box<dyn st
         rail.set_position(tauri::LogicalPosition::new(x, y))?;
     }
     #[cfg(target_os = "macos")]
-    hit_test::install(
-        rail.ns_window()? as usize,
-        app.state::<hit_test::Regions>().inner().clone(),
-        {
-            let window = rail.clone();
-            move |point| {
-                let payload = point.map(|(x, y)| json!({ "x": x, "y": y }));
-                let _ = window.emit("agent-studio-pointer", payload);
-            }
-        },
-    );
+    {
+        let ns_window = rail.ns_window()? as usize;
+        // Clicking the rail must not activate the host application (which
+        // would pull every other host window to the front). A failed
+        // conversion keeps the plain window, which still works.
+        if let Err(error) = panel::convert(ns_window) {
+            eprintln!("Agent Companion rail panel conversion: {error}");
+        }
+        hit_test::install(
+            ns_window,
+            app.state::<hit_test::Regions>().inner().clone(),
+            {
+                let window = rail.clone();
+                move |point| {
+                    let payload = point.map(|(x, y)| json!({ "x": x, "y": y }));
+                    let _ = window.emit("agent-studio-pointer", payload);
+                }
+            },
+        );
+    }
     #[cfg(target_os = "windows")]
     hit_test::install(
         rail.clone(),

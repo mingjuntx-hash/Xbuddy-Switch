@@ -28,6 +28,7 @@ pub mod refresh;
 pub mod rotate;
 pub mod session;
 pub mod session_backup;
+pub mod session_groups;
 pub mod session_link;
 pub mod switch;
 pub mod token_stats;

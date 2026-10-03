@@ -346,6 +346,7 @@ mod tests {
             operation_id: id.to_string(),
             kind: "sync".to_string(),
             variant: WbVariant::Cn,
+            source_variant: None,
             group_id: "g-1".to_string(),
             source: OperationMember {
                 account_id: None,

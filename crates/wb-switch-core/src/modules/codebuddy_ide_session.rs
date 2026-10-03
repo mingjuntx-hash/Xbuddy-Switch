@@ -258,6 +258,12 @@ fn switch_ide_with_copy(
     // 与对应档位的 `switch_account` 同序：先把「注定失败」的目标挡在关闭之前。
     let (_, data_dir) = flavor.validate_switch_target(account_id)?;
 
+    // This store is shared by domestic and international IDE variants. Serialize the
+    // complete link/copy/sync sequence namespace-wide, in addition to the legacy variant gate.
+    let _group_ops_lock = crate::modules::session_link::try_acquire_client_ops_lock(
+        &SessionPaths::for_codebuddy_ide(),
+    )?;
+
     // 复制与同步都拒绝「IDE 正在运行」：手动模式（`restart = false`）直接报错，不假装写入。
     let ide_running = flavor.is_running();
     if !restart && ide_running {

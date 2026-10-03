@@ -95,6 +95,39 @@ pub fn question(v: &Value) -> String {
         s
     }
 }
+/// Codex answers arrive as `<send_user_message_question_reply>` plus a JSON
+/// array whose `questionItemId` embeds `[tool, callId, index]`. A missing
+/// envelope or invalid JSON yields no answer instead of an error.
+pub fn question_reply_ids(prompt: &str) -> Vec<String> {
+    if !prompt.contains("<send_user_message_question_reply>") {
+        return vec![];
+    }
+    let (Some(start), Some(end)) = (prompt.find('['), prompt.rfind(']')) else {
+        return vec![];
+    };
+    if end < start {
+        return vec![];
+    }
+    serde_json::from_str::<Value>(&prompt[start..=end])
+        .ok()
+        .and_then(|items| {
+            items.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let ids: Value =
+                            serde_json::from_str(item["questionItemId"].as_str()?).ok()?;
+                        ids.as_array()?
+                            .get(1)?
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
 pub fn merge(mut base: Value, extra: Value) -> Value {
     if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
         b.extend(e.clone());
@@ -118,4 +151,27 @@ pub fn atomic_json(path: &std::path::Path, v: &Value) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
     std::fs::rename(tmp, path).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod question_reply_ids_tests {
+    use super::question_reply_ids;
+
+    fn envelope(items: &str) -> String {
+        format!("<send_user_message_question_reply>\n{items}\n</send_user_message_question_reply>")
+    }
+
+    #[test]
+    fn extracts_every_call_id_and_tolerates_bad_payloads() {
+        let two = serde_json::json!([
+            {"questionItemId": serde_json::json!(["t","a",0]).to_string(), "answer":"A"},
+            {"questionItemId": serde_json::json!(["t","b",1]).to_string(), "answer":"B"},
+        ]);
+        assert_eq!(question_reply_ids(&envelope(&two.to_string())), vec!["a", "b"]);
+        assert!(question_reply_ids("hello").is_empty());
+        assert!(question_reply_ids(&envelope("not json")).is_empty());
+        assert!(question_reply_ids(&envelope("{}")).is_empty());
+        assert!(question_reply_ids(&envelope(r#"[{"questionItemId":["t","x",0]}]"#)).is_empty());
+        assert!(question_reply_ids(&envelope(r#"[{"questionItemId":"[\"t\",\"\",0]"}]"#)).is_empty());
+    }
 }

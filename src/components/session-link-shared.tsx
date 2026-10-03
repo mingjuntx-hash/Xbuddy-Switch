@@ -66,7 +66,7 @@ export const STATUS_MIN_H = "min-h-[min(11rem,34vh)]";
 /** 加载骨架：结构与结果态一致（全选行 + 列表 + 提示行），避免数据到达时弹窗高度跳变。 */
 export function LinksSkeleton() {
   return (
-    <div className="space-y-2" aria-hidden>
+    <div className={cn("space-y-2", STATUS_MIN_H)} aria-hidden>
       <div className="flex items-center gap-2.5 px-1">
         <Skeleton className="size-3.5 shrink-0 rounded-sm" />
         <Skeleton className="h-5 w-40" />

@@ -19,15 +19,24 @@ import type { ImportPreviewAccount, WbVariant } from "@/lib/types";
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** 导入完成后回调（参数为导入结果计数）。 */
-  onImported?: (result: { imported: number; skipped: number; overwritten: number }) => void;
+  /** 导入完成后回调（参数为导入结果计数，附所选账号中的加密凭据数）。 */
+  onImported?: (result: {
+    imported: number;
+    skipped: number;
+    overwritten: number;
+    encrypted: number;
+  }) => void;
   /** 当前档位；仅用于文案，导入结果按文件内各账号自身的档位归类。 */
   variant?: WbVariant;
 }
 
-/** 导入预览账号展示名（脱敏展示：昵称/邮箱/uid）。 */
+/**
+ * 导入预览账号展示名（脱敏展示：昵称/邮箱/uid）。
+ * 只接受字符串：旧后端可能把信封对象透传进来，渲染对象会触发 React error #31（白屏）。
+ */
 function previewLabel(a: ImportPreviewAccount): string {
-  return a.nickname || a.email || a.uid || `第 ${a.index + 1} 项`;
+  const asLabel = (v: unknown) => (typeof v === "string" ? v : "");
+  return asLabel(a.nickname) || asLabel(a.email) || asLabel(a.uid) || `第 ${a.index + 1} 项`;
 }
 
 /** 导入账号弹框：选 JSON 文件 → 后端解析预览 → 勾选账号 → 导入合并。 */
@@ -110,8 +119,10 @@ export function ImportAccountsDialog({
     setBusy(true);
     setError("");
     try {
+      // 所选账号中的加密凭据数：随导入结果上报，供宿主附加能力限制提醒。
+      const encrypted = preview.filter((a) => selected.has(a.index) && a.encrypted).length;
       const res = await api.importAccounts(fileText, [...selected]);
-      onImported?.(res);
+      onImported?.({ ...res, encrypted });
       onOpenChange(false);
     } catch (e) {
       setError(api.asError(e));
@@ -177,7 +188,11 @@ export function ImportAccountsDialog({
                     onChange={() => toggle(a.index)}
                   />
                   <span className="min-w-0 flex-1 truncate text-sm">{previewLabel(a)}</span>
-                  {!a.hasToken && <Badge variant="outline">缺少 token</Badge>}
+                  {a.encrypted ? (
+                    <Badge variant="secondary">加密凭据</Badge>
+                  ) : (
+                    !a.hasToken && <Badge variant="outline">缺少 token</Badge>
+                  )}
                 </label>
               ))}
             </div>

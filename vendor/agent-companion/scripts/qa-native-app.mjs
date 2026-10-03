@@ -40,7 +40,7 @@ try {
  assert.equal(JSON.parse(await fs.readFile(path.join(out,'unsupported-view.json'))),'未知视图');
  const rail=JSON.parse(await fs.readFile(path.join(out,'agent-studio-rail/report.json')));
  const preferences=JSON.parse(await fs.readFile(path.join(out,'agent-studio-settings/report.json')));
- assert.equal(rail.avatars,1);assert.equal(rail.wait,1);assert.match(rail.text,/需要你确认/); // Existing native Codex adapter emits a generic question label.
+ assert.equal(rail.avatars,1);assert.equal(rail.wait,1);assert.match(rail.text,/请选择下一步/); // The native Codex adapter carries the question text from tool_input.
  assert.equal(rail.connection,'connected');assert.equal(preferences.settingsReady,true);
  assert.match(preferences.text,/监听与接入/,'real WebView renders integration management');
  assert.match(preferences.text,/已接入/,'native integration RPC reports installed status while details are collapsed');

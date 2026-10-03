@@ -1,6 +1,6 @@
 {
   "name": "xbuddy-switch",
-  "version": "0.1.53",
+  "version": "0.1.58",
   "description": "WorkBuddy 账号切换工具：本地 webui（浏览器操作）+ 桌面 App（安装后运行 xbuddy-switch）",
   "bin": {
     "xbuddy-switch": "bin/xbuddy-switch.js"

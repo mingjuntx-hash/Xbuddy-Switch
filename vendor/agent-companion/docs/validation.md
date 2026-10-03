@@ -24,7 +24,7 @@
 
 ## 验证边界
 
-- 原生 Codex 适配器沿用通用“需要你确认”文案，本次未扩展提问文本解析。浏览器完整提问文案检查使用模拟快照。
+- 原生 Codex 适配器已从 `tool_input` 解析提问原文与选项（2026-09-29 起，含异步提问）；原生应用验证断言真实问题原文，完整选项渲染检查仍使用模拟快照。
 - 原生应用验证使用真实 Rust Hook 通道和隔离会话，未代替用户对日常真实会话、实际跳转、通知授权与开机启动的验收。
 - 未验证 Windows/Linux，未签名公证、安装、发布或修改旧办公室/WB Switch 的集成。
 
@@ -78,6 +78,21 @@
 悬浮栏透明区域的鼠标穿透此前只有 macOS 实现，Windows 上整块 368x600 窗口都命中，透明部分照样吃掉下层窗口的点击与滚轮（见 PR #1）。用户在自己的 Windows 机器上安装 CI 产物（`Build desktop app` run 36174445604 的 `win-x64` 安装包）验收，4/4 通过：透明区单击/右键/滚轮穿透到下层窗口且悬浮栏自身不动；悬停头像弹出卡片、头像与卡片按钮交互正常；拖动手柄跟手，松手后透明区立即恢复穿透；卡片弹出/收起与欢迎动画结束后无残留死区，没有出现透明区变黑或闪烁。
 
 改动本身的本地证据：`cargo test --workspace --locked`（108 passed，含 4 个新增单测）、把真实 `hit_test.rs` 挂进临时 crate 的 `cargo check --target x86_64-pc-windows-msvc`、以及 CI 的 windows-latest `--locked` 测试。Windows 运行时的等价性判断（视觉、滚轮路由）只有这次实机结论，没有自动化覆盖。
+
+## macOS 悬浮栏不激活宿主（2026-09-29，独立 app 已验证；宿主内嵌待确认）
+
+独立 app 上，点击、拖拽悬浮栏不再激活其所属 App（宿主 wb-switch 内嵌构建的「主窗口层级不变」尚未验证，见本节末尾）。实现：rail 窗口用 `object_setClass` 换成自建 `AgentStudioRailPanel: NSPanel` 子类并追加 `NSWindowStyleMaskNonactivatingPanel`，同时 `setHidesOnDeactivate(false)` + `setBecomesKeyOnlyIfNeeded(true)`；类布局不符（tao 升级）时早退降级，窗口保持普通窗口继续可用。代码：`crates/agent-studio-desktop/src/panel.rs`。
+
+实现过程中由真机验证纠正的两个缺陷（离线单测与代码审查都未发现）：
+
+1. **真机上窗口类不是 `TaoWindow` 而是 `NSKVONotifying_TaoWindow`。** WKWebView 成为 contentView 时，WebKit 的 window-visibility observer 会对窗口做 KVO，类名带 `NSKVONotifying_` 前缀；原先「类名必须等于 `TaoWindow`」的校验在真机永远失败，转换被静默降级、修复完全不生效（隔离实例 stderr：`悬浮栏窗口类为 NSKVONotifying_TaoWindow ... 保持原状`）。现按「KVO 子类 + 直接父类为 `TaoWindow`」放行；KVO 子类不新增 ivar，实例大小与 `TaoWindow` 相同（本机 520 字节）。
+2. **换类前必须先摘除 contentView。** KVO 记账挂在被换掉的类上，换类后 WebKit 调 `removeObserver:forKeyPath:@"contentLayoutRect"` 会抛 `NSRangeException` 并 abort（Swift 探针复现）。现在顺序为：摘除 contentView（WebKit 在旧类仍存在时注销）→ 换类 → 挂回（WebKit 对新类重新注册）→ 再设 styleMask。`setStyleMask` 必须在挂回之后：它触发 `windowDidResize`，而 tao 的代理在该回调里 `contentView().unwrap()`，contentView 为空时 panic 跨 FFI 直接 abort（打包产物冒烟测试复现过一次）。
+
+自动化证据（2026-09-29）：`cargo test --workspace --locked`（desktop 29 passed，其中 `panel::tests` 4 条：空指针与外类窗口的降级、KVO 子类命名规则、替换类的 ivar 与覆盖方法）、`npm run test:rust`、`npm run typecheck`、`npm run lint` 全部通过；`npm run test:rust` 内的快照 parity 通过。`npm run test:native-app`（打包 app + 诊断）通过：rail/settings 两个窗口存在、Hook 问题渲染、无多余窗口、进程正常退出且无崩溃报告。隔离实例（独立 `AGENT_STUDIO_HOME`）stderr 无降级信息，确认转换在真机生效。
+
+真机交互（独立 app，macOS 26，另一 App 处于前台）：手动拖拽 grip 时光标变抓手、拖拽跟手（说明命中区与拖拽链路正常）；该次操作期间按 0.4s 采样 225 次（17:40:14–17:41:48），`Agent Companion` 的 `isActive` 恒为 false、前台 App 全程无变化（ChatGPT）—— 被点击/拖拽的 rail 未激活其所属 App；非激活悬停的光标变化同时确认可用。日志只记录这 90 秒内 app 未被激活，没有逐次手势标注；本轮用驱动工具做的自动化注入点击未能可靠命中 rail 的命中区（驱动移动指针时没有产生 hover 所需的 mouseMoved 事件），未形成可引用证据，本节结论以上述手动操作与采样日志为准。
+
+未覆盖：宿主（wb-switch）内嵌构建的「主窗口层级不变」需宿主同步快照后人工确认（属宿主范围）；透明区穿透、overflow/卡片按钮、托盘打开设置、会话关闭命令沿用 2026-09-22 的手工结论，本次未重测。
 
 ## 仍待人工确认
 

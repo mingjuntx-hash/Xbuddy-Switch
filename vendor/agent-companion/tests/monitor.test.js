@@ -244,24 +244,58 @@ test('WorkBuddy resumes in a new stable round and cannot retain an obsolete ask'
  const s=hub.snapshot().sessions[0];assert.equal(s.roundId,'r2');assert.equal(s.status,'running');assert.equal(s.pending.length,0);
 });
 
-test('asynchronous Codex records never wait or resolve a synchronous question',()=>{
+test('asynchronous Codex records wait, answer by call id, and never title an envelope',()=>{
  const hub=new Hub(),ctx={sessionId:'async'},events=[];
  const feed=p=>codexRecord({timestamp:Date.now(),type:'response_item',payload:p},ctx,e=>{events.push(e);hub.ingest(e)});
+ const session=()=>hub.snapshot().sessions[0];
+ const reply=tool=>`<send_user_message_question_reply>\n${JSON.stringify([{questionItemId:JSON.stringify([tool,tool,0]),answer:'A'}])}\n</send_user_message_question_reply>`;
  feed({type:'task_started',turn_id:'a'});
  for(const name of ['request_user_input_async','functions.request_user_input_async','mcp__codex__request_user_input_async']) {
-  feed({type:'function_call',name,call_id:name});
-  assert.equal(hub.snapshot().sessions[0].status,'running');
+  feed({type:'function_call',name,call_id:name,arguments:JSON.stringify({questions:[{title:'偏好'}]})});
+  assert.equal(session().status,'wait');
+  assert.deepEqual(session().pending.map(p=>[p.id,p.optional??false]),[[name,true]]);
+  assert.equal(session().pending[0].text,'偏好');
   feed({type:'function_call_output',call_id:name,output:'queued'});
+  assert.deepEqual(session().pending.map(p=>p.id),[name]); // A completion is not an answer.
+  feed({type:'message',role:'user',content:[{text:reply(name)}]});
+  assert.deepEqual(session().pending,[]); // The envelope clears its own call id.
+  assert.equal(session().title,'');       // The envelope never becomes a title.
  }
- assert.equal(events.filter(e=>['wait','resolve'].includes(e.type)).length,0);
+ assert.deepEqual(events.filter(e=>e.type==='wait').map(e=>e.optional??false),[true,true,true]);
+ // A synchronous question and an async one coexist; other internal envelopes
+ // neither answer nor title, and only a real message supersedes the async item.
  feed({type:'function_call',name:'functions.request_user_input',call_id:'sync'});
  feed({type:'custom_tool_call',name:'functions.request_user_input_async',call_id:'parallel'});
  feed({type:'custom_tool_call_output',call_id:'parallel',output:'queued'});
+ feed({type:'function_call',name:'functions.request_user_input_async',call_id:'inner'});
+ assert.deepEqual(session().pending.map(p=>p.id),['sync','parallel','inner']);
+ feed({type:'message',role:'user',content:[{text:'<in-app-browser-context url="x">ctx</in-app-browser-context>'}]});
+ assert.equal(session().title,'');
+ assert.deepEqual(session().pending.map(p=>p.id),['sync','parallel','inner']);
  feed({type:'message',role:'user',content:[{text:'A follow-up'}]});
- assert.deepEqual(hub.snapshot().sessions[0].pending.map(p=>p.id),['sync']);
- assert.equal(events.filter(e=>e.type==='resolve').length,0);
+ assert.deepEqual(session().pending.map(p=>p.id),['sync']);
+ assert.equal(session().title,'A follow-up');
  feed({type:'function_call_output',call_id:'sync',output:'answered'});
- assert.equal(hub.snapshot().sessions[0].status,'running');
+ assert.equal(session().status,'running');
+});
+
+test('optional waits expire on the snapshot clock without timing out synchronous ones',()=>{
+ const now=5_000_000;const hub=new Hub({now:()=>now});hub.ready=true;
+ send(hub,{type:'start',roundId:'t',ts:now});
+ send(hub,{type:'wait',callId:'expired',tool:'ask',text:'旧问题',optional:true,roundId:'t',ts:now-61_000});
+ send(hub,{type:'wait',callId:'live',tool:'ask',text:'新问题',optional:true,roundId:'t',ts:now-30_000});
+ send(hub,{type:'wait',callId:'sync',tool:'ask',text:'同步问题',roundId:'t',ts:now-90_000});
+ const snapshot=hub.snapshot().sessions[0];
+ assert.equal(snapshot.status,'wait');
+ assert.deepEqual(snapshot.pending.map(p=>[p.id,p.optional??false]),[['live',true],['sync',false]]);
+ assert.equal(hub.sessions.get('codex:full-id').pending.length,3); // Expiry is decided on read.
+ assert.equal(createNotificationTracker().ingest(hub.snapshot()).filter(a=>a.kind==='wait').length,2);
+ send(hub,{type:'resolve',callId:'live',roundId:'t',ts:now-29_999});
+ assert.equal(hub.snapshot().sessions[0].status,'wait');
+ send(hub,{type:'resolve',callId:'sync',roundId:'t',ts:now-29_998});
+ const resolved=hub.snapshot().sessions[0];
+ assert.equal(resolved.status,'running');
+ assert.deepEqual(resolved.pending,[]);
 });
 
 test('WorkBuddy questions preserve option labels and descriptions through the monitor snapshot',async()=>{

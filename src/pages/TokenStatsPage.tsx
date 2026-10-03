@@ -35,6 +35,7 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart";
 import { DemoAction } from "@/components/demo-action";
+import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import {
   Dialog,
   DialogContent,
@@ -1647,32 +1648,36 @@ export default function TokenStatsPage() {
         >
           <TabsList className="h-auto max-w-full flex-wrap" aria-label="Token 数据来源">
             <TabsTrigger
-              className="max-w-full whitespace-normal"
+              className="max-w-full gap-2 whitespace-normal"
               value="workbuddy"
               disabled={Boolean(stats && !stats.sources.some((item) => item.source === "workbuddy"))}
             >
+              <WorkBuddyMark size={16} />
               WorkBuddy
             </TabsTrigger>
             <TabsTrigger
-              className="max-w-full whitespace-normal"
+              className="max-w-full gap-2 whitespace-normal"
               value="workbuddy-ai"
               disabled={Boolean(stats && !stats.sources.some((item) => item.source === "workbuddy-ai"))}
             >
+              <WorkBuddyAiMark size={16} />
               WorkBuddy 国际版
             </TabsTrigger>
             <TabsTrigger
-              className="max-w-full whitespace-normal"
+              className="max-w-full gap-2 whitespace-normal"
               value="codebuddy-cli"
               disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-cli"))}
             >
+              <CodeBuddyMark size={16} />
               CodeBuddy CLI
             </TabsTrigger>
             <TabsTrigger
-              className="max-w-full whitespace-normal"
+              className="max-w-full gap-2 whitespace-normal"
               value="codebuddy-ide"
               disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-ide"))}
             >
-              CodeBuddy IDE / VS Code CodeBuddy 插件
+              <CodeBuddyCnIdeMark size={16} />
+              CodeBuddy IDE / VS Code
             </TabsTrigger>
           </TabsList>
         </Tabs>

@@ -11,7 +11,9 @@ use crate::modules::config::{accounts_file, atomic_write, now_ms};
 use crate::modules::variant::WbVariant;
 
 /// 判断字段是否为 WorkBuddy 5.6 加密信封对象（`{$wbEncrypted, envelope}`）。
-fn is_envelope(v: &Value, key: &str) -> bool {
+///
+/// 导出导入预览与采集共用同一判定，不要在调用方复制实现。
+pub fn is_envelope(v: &Value, key: &str) -> bool {
     matches!(v.get(key), Some(Value::Object(map)) if map.contains_key("$wbEncrypted"))
 }
 
@@ -92,9 +94,30 @@ pub fn find_account(account_id: &str) -> Option<Value> {
     find_account_in(&load_accounts(), account_id)
 }
 
-/// 账号展示名（email → nickname → uid → unknown）。
+/// 从 profile_raw 读取官方手机号（仅接受非空字符串）。
+///
+/// 手机号不落库、每次实时读取，避免与官方数据产生第二份副本。
+fn profile_phone_number(acc: &Value) -> Option<String> {
+    acc.get("profile_raw")
+        .and_then(|p| p.get("phoneNumber"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// 账号展示名：按本地 `displayField` 选择（note / phone / nickname），
+/// 兜底 email → nickname → uid → unknown。
+///
+/// `displayField` 缺失或取值异常时行为与改造前一致（email → nickname → uid）。
 pub fn account_display_name(acc: &Value) -> String {
-    get_str(acc, "email")
+    let by_field = match get_str(acc, "displayField").as_deref() {
+        Some("note") => get_str(acc, "note"),
+        Some("phone") => profile_phone_number(acc),
+        _ => None,
+    };
+    by_field
+        .or_else(|| get_str(acc, "email"))
         .or_else(|| get_str(acc, "nickname"))
         .or_else(|| get_str(acc, "uid"))
         .unwrap_or_else(|| "unknown".to_string())
@@ -109,6 +132,9 @@ pub fn account_meta(acc: &Value) -> Value {
         "uid": display_value(acc, "uid"),
         "email": display_value(acc, "email"),
         "nickname": display_value(acc, "nickname"),
+        "phoneNumber": profile_phone_number(acc).map(Value::String).unwrap_or(Value::Null),
+        "note": display_value(acc, "note"),
+        "displayField": display_value(acc, "displayField"),
         "enterpriseName": display_value(acc, "enterpriseName"),
         "expiresAt": display_value(acc, "expiresAt"),
         "refreshExpiresAt": display_value(acc, "refreshExpiresAt"),
@@ -233,6 +259,14 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
                 }
             }
         }
+        // 本地展示字段（备注 / 显示选择）不来自官方采集：采集结果缺失时保留已有值。
+        for key in ["note", "displayField"] {
+            if collected.get(key).is_none() {
+                if let Some(v) = existing.get(key) {
+                    collected[key] = v.clone();
+                }
+            }
+        }
 
         if let Some(existing_id) = get_str(existing, "id") {
             collected["id"] = Value::String(existing_id);
@@ -293,6 +327,72 @@ pub fn upsert_account(updated: &Value) -> std::io::Result<()> {
     save_accounts(&accounts)
 }
 
+/// 备注长度上限（字符数），与前端输入框 maxLength 保持一致。
+const NOTE_MAX_CHARS: usize = 24;
+
+/// 更新账号的本地展示字段：`note`（字符串或 null=清空）与 `displayField`。
+///
+/// 只触碰本地展示字段，不修改 uid / token / profile_raw 等官方数据。
+/// 先整体校验再写入，避免部分更新。返回更新后的 `account_meta`。
+pub fn update_account_display(account_id: &str, patch: &Value) -> Result<Value, String> {
+    let mut accounts = load_accounts();
+    let updated = update_account_display_in(&mut accounts, account_id, patch)?;
+    save_accounts(&accounts).map_err(|error| error.to_string())?;
+    Ok(account_meta(&updated))
+}
+
+/// 更新账号展示字段的内存实现（不落盘，便于单测）。
+///
+/// 校验失败时不修改任何记录；成功时返回更新后的完整记录。
+pub fn update_account_display_in(
+    accounts: &mut [Value],
+    account_id: &str,
+    patch: &Value,
+) -> Result<Value, String> {
+    let index = accounts
+        .iter()
+        .position(|a| get_str(a, "id").as_deref() == Some(account_id))
+        .ok_or_else(|| "账号不存在".to_string())?;
+
+    let note_update = match patch.get("note") {
+        None => None,
+        Some(Value::Null) => Some(Value::Null),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Some(Value::Null)
+            } else if trimmed.chars().count() > NOTE_MAX_CHARS {
+                return Err(format!("备注不能超过 {NOTE_MAX_CHARS} 个字符"));
+            } else {
+                Some(Value::String(trimmed.to_string()))
+            }
+        }
+        Some(_) => return Err("备注格式无效".to_string()),
+    };
+    let field_update = match patch.get("displayField") {
+        None => None,
+        Some(value) => {
+            let field = value.as_str().unwrap_or("");
+            if !matches!(field, "nickname" | "phone" | "note") {
+                return Err("显示字段无效".to_string());
+            }
+            Some(Value::String(field.to_string()))
+        }
+    };
+
+    let obj = accounts[index]
+        .as_object_mut()
+        .ok_or_else(|| "账号记录损坏".to_string())?;
+    if let Some(note) = note_update {
+        obj.insert("note".to_string(), note);
+    }
+    if let Some(field) = field_update {
+        obj.insert("displayField".to_string(), field);
+    }
+
+    Ok(accounts[index].clone())
+}
+
 /// 覆盖写入的内存实现：按 id 覆盖；id 缺失或未命中时回退按 uid 收敛到已有
 /// 记录；仍无归属才追加，且追加前补 id。
 ///
@@ -321,6 +421,16 @@ fn upsert_account_in(accounts: &mut Vec<Value>, updated: &Value) {
     if let Some(index) = matched_index {
         let mut next = updated.clone();
         inherit_existing_variant(&accounts[index], &mut next);
+        // 本地展示字段（备注 / 显示选择）不从官方数据来：updated 缺失时保留已有值。
+        if let Some(obj) = next.as_object_mut() {
+            for key in ["note", "displayField"] {
+                if !obj.contains_key(key) {
+                    if let Some(v) = accounts[index].get(key) {
+                        obj.insert(key.to_string(), v.clone());
+                    }
+                }
+            }
+        }
         // uid 回退时保留本地稳定 id，即使刷新对象携带了另一 id；历史脏数据
         // 的空 id 不继承，优先保留刷新对象的有效 id，否则生成新 id。
         if uid_matched_index.is_some() {
@@ -1080,6 +1190,145 @@ mod tests {
             "没写备注就不该凭空多出这个键"
         );
         assert_eq!(account_meta(&saved)["note"], Value::Null);
+    }
+
+    // -----------------------------------------------------------------------
+    // 本地展示字段：备注与显示字段选择
+    // -----------------------------------------------------------------------
+
+    /// displayField 缺失时展示名保持改造前行为（email → nickname → uid）。
+    #[test]
+    fn display_name_without_display_field_keeps_legacy_fallback() {
+        let with_email = account("a-1", Some("uid-1"), "小明", Some("a@b.c"));
+        assert_eq!(account_display_name(&with_email), "a@b.c");
+        let no_email = account("a-2", Some("uid-2"), "小明", None);
+        assert_eq!(account_display_name(&no_email), "小明");
+    }
+
+    /// displayField = note / phone 时优先取对应字段，取不到回退原兜底链。
+    #[test]
+    fn display_name_follows_display_field_with_fallback() {
+        let mut acc = account("a-1", Some("uid-1"), "小明", None);
+        acc["note"] = json!("工作号");
+        acc["displayField"] = json!("note");
+        assert_eq!(account_display_name(&acc), "工作号");
+
+        acc["note"] = Value::Null;
+        assert_eq!(account_display_name(&acc), "小明", "备注为空应回退昵称");
+
+        acc["displayField"] = json!("phone");
+        assert_eq!(account_display_name(&acc), "小明", "无手机号应回退昵称");
+        acc["profile_raw"] = json!({"phoneNumber": "13800138000"});
+        assert_eq!(account_display_name(&acc), "13800138000");
+
+        acc["displayField"] = json!("nickname");
+        assert_eq!(account_display_name(&acc), "小明");
+    }
+
+    /// account_meta 下发手机号（实时读 profile_raw）、备注与显示字段。
+    #[test]
+    fn account_meta_exposes_phone_note_and_display_field() {
+        let mut acc = account("a-1", Some("uid-1"), "小明", None);
+        acc["profile_raw"] = json!({"phoneNumber": "13800138000"});
+        acc["note"] = json!("工作号");
+        acc["displayField"] = json!("phone");
+        let meta = account_meta(&acc);
+        assert_eq!(meta["phoneNumber"], "13800138000");
+        assert_eq!(meta["note"], "工作号");
+        assert_eq!(meta["displayField"], "phone");
+
+        // profile_raw 缺失或异常形态：手机号折叠为 null，不泄露对象。
+        let bare = account("a-2", Some("uid-2"), "小红", None);
+        let meta = account_meta(&bare);
+        assert!(meta["phoneNumber"].is_null());
+        assert!(meta["note"].is_null());
+        assert!(meta["displayField"].is_null());
+    }
+
+    /// 更新接口：设置 / 清空备注、切换显示字段、只更新传入项。
+    #[test]
+    fn update_account_display_sets_note_and_field() {
+        let mut accounts = vec![account("a-1", Some("uid-1"), "小明", None)];
+
+        let updated = update_account_display_in(
+            &mut accounts,
+            "a-1",
+            &json!({"note": "  工作号  ", "displayField": "note"}),
+        )
+        .expect("valid patch should apply");
+        assert_eq!(updated["note"], "工作号", "备注应 trim");
+        assert_eq!(updated["displayField"], "note");
+
+        // 只改显示字段：备注保持。
+        update_account_display_in(&mut accounts, "a-1", &json!({"displayField": "nickname"}))
+            .expect("field-only patch should apply");
+        assert_eq!(accounts[0]["note"], "工作号");
+        assert_eq!(accounts[0]["displayField"], "nickname");
+
+        // 显式 null 与纯空白都等价于清空。
+        update_account_display_in(&mut accounts, "a-1", &json!({"note": null}))
+            .expect("null note should clear");
+        assert!(accounts[0]["note"].is_null());
+        update_account_display_in(&mut accounts, "a-1", &json!({"note": "   "}))
+            .expect("blank note should clear");
+        assert!(accounts[0]["note"].is_null());
+    }
+
+    /// 更新接口的校验：非法字段 / 未知 id / 超长备注都不写入。
+    #[test]
+    fn update_account_display_rejects_invalid_patch() {
+        let mut accounts = vec![account("a-1", Some("uid-1"), "小明", None)];
+
+        assert!(
+            update_account_display_in(&mut accounts, "a-1", &json!({"displayField": "email"}))
+                .is_err(),
+            "非白名单显示字段应拒绝"
+        );
+        assert!(
+            update_account_display_in(&mut accounts, "a-1", &json!({"note": 42})).is_err(),
+            "非字符串备注应拒绝"
+        );
+        assert!(
+            update_account_display_in(&mut accounts, "missing", &json!({"note": "x"})).is_err(),
+            "未知账号应报错"
+        );
+        let long = "字".repeat(NOTE_MAX_CHARS + 1);
+        assert!(
+            update_account_display_in(&mut accounts, "a-1", &json!({"note": long})).is_err(),
+            "超长备注应拒绝"
+        );
+        // 任一失败都不应留下部分更新。
+        assert!(accounts[0].get("note").is_none());
+        assert!(accounts[0].get("displayField").is_none());
+    }
+
+    /// 采集合并（扫码重登）保留本地备注与显示选择。
+    #[test]
+    fn collected_upsert_preserves_local_display_fields() {
+        let mut existing = account("a-1", Some("uid-1"), "小明", None);
+        existing["note"] = json!("工作号");
+        existing["displayField"] = json!("note");
+        let mut accounts = vec![existing];
+
+        let collected = account("a-1", Some("uid-1"), "小明（官方更新）", None);
+        let saved = upsert_collected_account(&mut accounts, collected);
+        assert_eq!(saved["note"], "工作号");
+        assert_eq!(saved["displayField"], "note");
+        assert_eq!(saved["nickname"], "小明（官方更新）");
+    }
+
+    /// token 刷新路径（upsert_account_in）保留本地展示字段。
+    #[test]
+    fn refresh_upsert_preserves_local_display_fields() {
+        let mut existing = account("a-1", Some("uid-1"), "小明", None);
+        existing["note"] = json!("工作号");
+        existing["displayField"] = json!("phone");
+        let mut accounts = vec![existing];
+
+        let refreshed = account("a-1", Some("uid-1"), "小明", None);
+        upsert_account_in(&mut accounts, &refreshed);
+        assert_eq!(accounts[0]["note"], "工作号");
+        assert_eq!(accounts[0]["displayField"], "phone");
     }
 }
 

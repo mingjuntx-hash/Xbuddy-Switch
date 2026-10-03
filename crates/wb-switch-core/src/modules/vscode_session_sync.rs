@@ -115,6 +115,24 @@ fn conversation_dir(
         .join(conversation_id)
 }
 
+/// Resolve one explicitly identified session without consulting the client's active login UID.
+/// The opaque workspace hash is returned only as a display locator; it is never decoded.
+pub(crate) fn session_location_and_content(
+    spec: SessionStoreSpec,
+    root: &Path,
+    uid: &str,
+    conversation_id: &str,
+) -> Option<(String, String, ContentState)> {
+    let index = conversation_index(spec, root, uid);
+    let locator = index.get(conversation_id)?;
+    let dir = conversation_dir(spec, root, uid, &locator.workspace_hash, conversation_id);
+    Some((
+        locator.workspace_hash.clone(),
+        locator.title.clone(),
+        vscode_session_link::read_session_content(&dir, conversation_id),
+    ))
+}
+
 /// 一次预览 / 同步内不变的输入：数据仓、账号、数据根与两侧会话定位索引。
 struct SyncContext<'a> {
     spec: SessionStoreSpec,
@@ -174,14 +192,22 @@ impl SyncContext<'_> {
     }
 }
 
-/// 账号库里按 uid 找账号 id（成员 `accountId` 仅作展示，身份判定以 uid 为准）。
-fn account_id_for_uid(paths: &SessionPaths, uid: &str) -> Option<String> {
+/// Account metadata is display-only; plugin identity and storage remain UID based.
+fn account_metadata_for_uid(
+    paths: &SessionPaths,
+    uid: &str,
+) -> (Option<String>, Option<WbVariant>) {
     let accounts = account::load_accounts_at(&account::accounts_file_in(&paths.store_root));
-    accounts
+    match accounts
         .iter()
         .find(|account| account.get("uid").and_then(Value::as_str) == Some(uid))
-        .and_then(|account| account.get("id").and_then(Value::as_str))
-        .map(String::from)
+    {
+        Some(account) => (
+            account.get("id").and_then(Value::as_str).map(String::from),
+            Some(account::variant_of(account)),
+        ),
+        None => (None, None),
+    }
 }
 
 /// 取报告里的账号 uid（空串按缺失处理）。
@@ -306,8 +332,18 @@ fn register_one(
         return Err("已复制但副本内容与来源不一致，未建立关联".to_string());
     }
     let normalized = source_content.normalized.clone();
-    let source_account_id = account_id_for_uid(paths, source_uid);
-    let target_account_id = account_id_for_uid(paths, target_uid);
+    let (source_account_id, source_variant) = account_metadata_for_uid(paths, source_uid);
+    let (target_account_id, target_variant) = account_metadata_for_uid(paths, target_uid);
+    let source_variant = if isolate_variant {
+        Some(variant)
+    } else {
+        source_variant
+    };
+    let target_variant = if isolate_variant {
+        Some(variant)
+    } else {
+        target_variant
+    };
     let (source_uid, target_uid) = (source_uid.to_string(), target_uid.to_string());
     let (source_id, target_id) = (source_id.to_string(), target_id.to_string());
     session_link::with_link_store_write(paths, move |store| {
@@ -340,6 +376,14 @@ fn register_one(
         {
             Some(member_id) => {
                 session_link::set_member_state(group, &member_id, MemberState::Active);
+                if let Some(value) = source_variant {
+                    group
+                        .members
+                        .iter_mut()
+                        .find(|member| member.member_id == member_id)
+                        .unwrap()
+                        .variant = Some(value);
+                }
                 member_id
             }
             None => {
@@ -351,6 +395,7 @@ fn register_one(
                         account_id: source_account_id,
                         uid: source_uid.clone(),
                         session_id: source_id.clone(),
+                        variant: Some(source_variant.unwrap_or(variant)),
                         state: MemberState::Active,
                         linked_at: now_ms(),
                         last_synced_at: None,
@@ -364,6 +409,14 @@ fn register_one(
         {
             Some(member_id) => {
                 session_link::set_member_state(group, &member_id, MemberState::Active);
+                if let Some(value) = target_variant {
+                    group
+                        .members
+                        .iter_mut()
+                        .find(|member| member.member_id == member_id)
+                        .unwrap()
+                        .variant = Some(value);
+                }
                 member_id
             }
             None => {
@@ -376,6 +429,7 @@ fn register_one(
                         account_id: target_account_id,
                         uid: target_uid.clone(),
                         session_id: target_id.clone(),
+                        variant: Some(target_variant.unwrap_or(variant)),
                         state: MemberState::Active,
                         linked_at: now_ms(),
                         last_synced_at: None,
@@ -663,7 +717,9 @@ fn preview_group_item(context: &SyncContext<'_>, group: &LinkGroup) -> Value {
         .iter()
         .map(|mode| mode.as_str())
         .collect();
-    let actionable = !modes.is_empty();
+    // Ahead stays unavailable in ordinary sync; group unification needs a verified
+    // token for its separate explicit overwrite mode.
+    let actionable = !modes.is_empty() || decision.verdict == SyncVerdict::Ahead;
 
     let mut item = json!({
         "groupId": group.id,
@@ -1005,7 +1061,7 @@ fn plan_sync_item(
 fn execute_sync_item(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value, String> {
     match plan.mode {
         SyncMode::FastForward => fast_forward(paths, plan),
-        SyncMode::Overwrite => overwrite(paths, plan),
+        SyncMode::Overwrite | SyncMode::UnifyOverwrite => overwrite(paths, plan),
     }
 }
 
@@ -1923,6 +1979,96 @@ mod tests {
         orphans
     }
 
+    #[test]
+    fn plugin_cross_region_copy_registration_preview_and_sync() {
+        for (source_variant, target_variant) in [
+            (WbVariant::Cn, WbVariant::Ai),
+            (WbVariant::Ai, WbVariant::Cn),
+        ] {
+            let fixture = Fixture::new("cross-region");
+            seed_source(&fixture);
+            let target =
+                json!({ "id": "acc-dst", "uid": DST_UID, "variant": target_variant.as_str() });
+            write(&account::accounts_file_in(&fixture.store), &json!([
+                { "id": "acc-src", "uid": SRC_UID, "variant": source_variant.as_str() }, target.clone()
+            ]).to_string());
+            let report = copy_sessions_in(
+                &fixture.root,
+                &fixture.backup,
+                SRC_UID,
+                DST_UID,
+                &[CopyItem {
+                    workspace_hash: WS.to_string(),
+                    conversation_id: CONV_SRC.to_string(),
+                }],
+            )
+            .unwrap();
+            let target_conv = report["copied"][0]["newId"].as_str().unwrap();
+            assert!(register_copied_sessions(
+                &fixture.root,
+                &fixture.paths(),
+                target_variant,
+                &report
+            )
+            .is_empty());
+            // Re-registration must reuse the group even when its region differs from the caller.
+            assert!(register_copied_sessions(
+                &fixture.root,
+                &fixture.paths(),
+                source_variant,
+                &report
+            )
+            .is_empty());
+            let StoreState::Ready(store) = session_link::load_store(&fixture.paths()) else {
+                panic!("store unavailable")
+            };
+            assert_eq!(store.groups.len(), 1);
+            let group = &store.groups[0];
+            assert_eq!(
+                group
+                    .members
+                    .iter()
+                    .find(|m| m.uid == SRC_UID)
+                    .unwrap()
+                    .variant,
+                Some(source_variant)
+            );
+            assert_eq!(
+                group
+                    .members
+                    .iter()
+                    .find(|m| m.uid == DST_UID)
+                    .unwrap()
+                    .variant,
+                Some(target_variant)
+            );
+            append_round(&fixture, MSG_3, MSG_4, REQ_2, "cross region append");
+            let preview =
+                links_preview_at(&fixture.root, &fixture.paths(), SRC_UID, &target).unwrap();
+            assert_eq!(preview["groups"].as_array().unwrap().len(), 1);
+            let item = &preview["groups"][0];
+            assert_eq!(item["verdict"], "fastForward");
+            let result = sync_selected_at(
+                &fixture.root,
+                &fixture.paths(),
+                SRC_UID,
+                &target,
+                &[selection(
+                    item["groupId"].as_str().unwrap(),
+                    item["previewToken"].as_str().unwrap(),
+                    SyncMode::FastForward,
+                )],
+            )
+            .unwrap();
+            assert_eq!(result["synced"].as_array().unwrap().len(), 1, "{result}");
+            assert!(result["errors"].as_array().unwrap().is_empty(), "{result}");
+            assert_eq!(
+                digests(&fixture.dst_conv_dir(target_conv), target_conv),
+                digests(&fixture.src_conv_dir(), CONV_SRC)
+            );
+        }
+    }
+
     /// AC1：复制成功后出现 1 个组、2 个 active 成员、1 条配对基线；重复复制不产生重复组。
     #[test]
     fn copy_registers_one_group_and_does_not_duplicate() {
@@ -2724,6 +2870,7 @@ mod tests {
             account_id: Some(uid.to_string()),
             uid: uid.to_string(),
             session_id: CONV_SRC.to_string(),
+            variant: None,
             state: MemberState::Active,
             linked_at: 0,
             last_synced_at: None,

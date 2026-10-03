@@ -67,7 +67,22 @@ pub const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS 
 // 路径
 // ---------------------------------------------------------------------------
 
+/// 覆盖家目录的环境变量名。
+///
+/// 设置后 `home_dir()` 返回它的值，于是 `~/.wb-switch`、`~/.codebuddy`、
+/// `~/.codebuddy-rotate` 全部落在指定目录下。用途：
+/// - 集成测试把家目录沙箱化，避免读写真实账号与 CLI 配置；
+/// - 自定义部署位置。
+///
+/// 未设置时行为与之前完全一致（`dirs::home_dir()`）。
+pub const HOME_ENV_VAR: &str = "WB_SWITCH_HOME";
+
 pub fn home_dir() -> PathBuf {
+    if let Some(overridden) = std::env::var_os(HOME_ENV_VAR) {
+        if !overridden.is_empty() {
+            return PathBuf::from(overridden);
+        }
+    }
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 

@@ -1,6 +1,9 @@
 import path from 'node:path';
 export const TERMINAL = new Set(['done', 'error', 'aborted']);
 export const STALE_MS = 45 * 60 * 1000;
+// Optional waits stop blocking after this window, matching the host app's own
+// 60-second no-interaction auto-resolution.
+export const OPTIONAL_TTL_MS = 60_000;
 
 function asId(value) {
   return value == null || value === '' ? '' : String(value);
@@ -68,7 +71,13 @@ export class Hub {
       s.steps = s.steps.slice(-20); s.status = s.pending.length ? 'wait' : 'running';
     }
     if (ev.type === 'wait' && !TERMINAL.has(s.status)) {
-      if (!s.pending.some(p => p.id === ev.callId)) s.pending.push({ id: ev.callId, tool: ev.tool, text: String(ev.text || '等待用户输入').slice(0, 500), questions: ev.questions || [], ts });
+      if (!s.pending.some(p => p.id === ev.callId)) {
+        const item = { id: ev.callId, tool: ev.tool, text: String(ev.text || '等待用户输入').slice(0, 500), questions: ev.questions || [], ts };
+        // Only async Codex questions are optional; every other source keeps an
+        // item that never expires on its own.
+        if (ev.optional === true) item.optional = true;
+        s.pending.push(item);
+      }
       s.status = 'wait'; this.event(s, 'wait', ev.callId, ts);
     }
     if (ev.type === 'resolve') {
@@ -100,8 +109,13 @@ export class Hub {
     const hosted = hostedCodexIds(this.sessions.values());
     const hidden = s => s.source === 'codex' && this.hiddenCodegCodexIds.has(asId(s.sessionId).replace(/^thr_/, '')) || isCodegHostedCodex(s, hosted);
     const sessions = [...this.sessions.values()].filter(s => !hidden(s)).map(s => {
-      const stale = !TERMINAL.has(s.status) && !s.pending.length && now - s.updatedAt > STALE_MS;
-      return { ...s, project: path.basename(s.cwd) || s.source, status: stale ? 'unknown' : s.status, stale, elapsed: Math.max(0, ((s.endedAt || now) - s.startedAt) / 1000), progress: null };
+      // An optional wait expires lazily on read: the host app hides its own
+      // question card after the user stops interacting, so a stale item must
+      // not keep the session in `wait`.
+      const pending = s.pending.filter(p => !(p.optional === true && now - (p.ts ?? 0) > OPTIONAL_TTL_MS));
+      const status = s.status === 'wait' && !pending.length ? 'running' : s.status;
+      const stale = !TERMINAL.has(status) && !pending.length && now - s.updatedAt > STALE_MS;
+      return { ...s, pending, project: path.basename(s.cwd) || s.source, status: stale ? 'unknown' : status, stale, elapsed: Math.max(0, ((s.endedAt || now) - s.startedAt) / 1000), progress: null };
     }).sort((a,b) => b.updatedAt - a.updatedAt);
     // A long replay can evict old events; unresolved requests must stay discoverable.
     const events = new Map([...this.events].filter(([, event]) => {

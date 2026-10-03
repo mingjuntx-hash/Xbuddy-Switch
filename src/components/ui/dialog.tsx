@@ -1,4 +1,5 @@
 import * as React from "react";
+import { createPortal } from "react-dom";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { XIcon } from "lucide-react";
 
@@ -44,29 +45,41 @@ function DialogContent({
   showCloseButton = true,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & { showCloseButton?: boolean }) {
-  return (
-    <DialogPortal data-slot="dialog-portal">
+  if (typeof document === "undefined") return null;
+
+  // Keep positioning separate from the animated surface. Percentage translation
+  // plus a changing height can jump at the end of scale animations in WebView.
+  // Overlay and Content own their Radix Presence: a non-animated wrapper inside
+  // DialogPortal would otherwise unmount before Content's exit animation ends.
+  return createPortal(
+    <>
       <DialogOverlay />
-      <DialogPrimitive.Content
-        data-slot="dialog-content"
-        className={cn(
-          "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 sm:max-w-lg",
-          className,
-        )}
-        {...props}
+      <div
+        data-slot="dialog-layout"
+        className="pointer-events-none fixed inset-0 z-50 grid place-items-center empty:hidden"
       >
-        {children}
-        {showCloseButton && (
-          <DialogPrimitive.Close
-            data-slot="dialog-close"
-            className="ring-offset-background focus:ring-ring data-[state=open]:bg-accent data-[state=open]:text-muted-foreground absolute top-4 right-4 cursor-pointer rounded-xs opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
-          >
-            <XIcon />
-            <span className="sr-only">关闭</span>
-          </DialogPrimitive.Close>
-        )}
-      </DialogPrimitive.Content>
-    </DialogPortal>
+        <DialogPrimitive.Content
+          data-slot="dialog-content"
+          className={cn(
+            "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 pointer-events-auto relative z-50 grid w-full max-w-[calc(100%-2rem)] gap-4 rounded-lg border p-6 shadow-lg duration-200 sm:max-w-lg",
+            className,
+          )}
+          {...props}
+        >
+          {children}
+          {showCloseButton && (
+            <DialogPrimitive.Close
+              data-slot="dialog-close"
+              className="ring-offset-background focus:ring-ring data-[state=open]:bg-accent data-[state=open]:text-muted-foreground absolute top-4 right-4 cursor-pointer rounded-xs opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
+            >
+              <XIcon />
+              <span className="sr-only">关闭</span>
+            </DialogPrimitive.Close>
+          )}
+        </DialogPrimitive.Content>
+      </div>
+    </>,
+    document.body,
   );
 }
 

@@ -169,6 +169,20 @@ export function CodeBuddyAiIdeMark({ size = 32, className }: MarkProps) {
   );
 }
 
+/** VS Code 内 CodeBuddy 扩展的国际版标记：同一字形 + INTL 角标（插件账号分国内 / 国际区）。 */
+export function VscodeExtAiMark({ size = 32, className }: MarkProps) {
+  return (
+    <span
+      aria-hidden
+      className={cn("relative inline-flex shrink-0", className)}
+      style={{ width: size, height: size }}
+    >
+      <VscodeExtMark size={size} />
+      <IntlBadge size={size} />
+    </span>
+  );
+}
+
 /**
  * JetBrains IDE（IntelliJ IDEA / PyCharm）标记：官方 2021 品牌字块的简化版。
  *

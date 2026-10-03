@@ -613,6 +613,11 @@ pub fn switch_vscode_ext_with_copy(
     // 账号存在但 `access_token` 为空 / 数据目录或 state.vscdb 缺失时不该关掉用户的编辑器。
     vscode_ext::validate_switch_target(account_id)?;
 
+    // Plugin groups span account variants but share one link store; do not let concurrent
+    // cn/ai switch flows race their duplicate checks and link registration.
+    let _group_ops_lock =
+        crate::modules::session_link::try_acquire_client_ops_lock(&SessionPaths::for_vscode_ext())?;
+
     // 关闭必须在复制与同步之前：两者都会拒绝「VS Code 正在运行」。
     let closed = vscode_ext::close_vscode_for_switch(restart)?;
 

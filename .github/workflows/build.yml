@@ -77,7 +77,10 @@ jobs:
                   "cli_bin": "wb-switch-linux-x64",
                   "platform_tag": "linux-x64",
                   "bundles": "deb,appimage",
-                  "update_arch": "",
+                  "update_os": "linux",
+                  "update_arch": "x86_64",
+                  "update_bundle": "appimage",
+                  "update_archive_name": "workbuddy-switch-linux-x86_64.AppImage",
               },
           ]
           event = os.environ.get("EVENT_NAME", "")
@@ -240,6 +243,41 @@ jobs:
           fi
           echo "updater bundle dir: $BUNDLE_DIR (version $VER)"
           ls -la "$BUNDLE_DIR" || true
+          if [ "$UPDATE_OS" = "linux" ]; then
+            # linux 有 deb / AppImage 两种安装形态：各自收集归档与签名，再生成两份 manifest。
+            # 本分支自行完成全部产物收集，不走下方 macOS/Windows 的公共尾部。
+            LINUX_ROOT="$(dirname "$BUNDLE_DIR")"
+            APPIMAGE="$(find "$LINUX_ROOT/appimage" -maxdepth 1 -type f -name '*.AppImage' | sort)"
+            DEB="$(find "$LINUX_ROOT/deb" -maxdepth 1 -type f -name '*.deb' | sort)"
+            APPIMAGE_COUNT=$(printf '%s\n' "$APPIMAGE" | sed '/^$/d' | wc -l | tr -d ' ')
+            DEB_COUNT=$(printf '%s\n' "$DEB" | sed '/^$/d' | wc -l | tr -d ' ')
+            if [ "$APPIMAGE_COUNT" != 1 ] || [ "$DEB_COUNT" != 1 ]; then
+              echo "error: expected exactly 1 .AppImage and 1 .deb, found $APPIMAGE_COUNT / $DEB_COUNT" >&2
+              printf 'appimage: %s\ndeb: %s\n' "$APPIMAGE" "$DEB" >&2
+              exit 1
+            fi
+            if [ ! -f "$APPIMAGE.sig" ] || [ ! -f "$DEB.sig" ]; then
+              echo "error: missing signature for $APPIMAGE or $DEB" >&2
+              exit 1
+            fi
+            cp "$APPIMAGE" "dist-bin/workbuddy-switch-linux-${UPDATE_ARCH}.AppImage"
+            cp "$APPIMAGE.sig" "dist-bin/workbuddy-switch-linux-${UPDATE_ARCH}.AppImage.sig"
+            cp "$DEB" "dist-bin/workbuddy-switch-linux-${UPDATE_ARCH}.deb"
+            cp "$DEB.sig" "dist-bin/workbuddy-switch-linux-${UPDATE_ARCH}.deb.sig"
+            UPDATE_VERSION="$VER" UPDATE_OS=linux UPDATE_ARCH="$UPDATE_ARCH" UPDATE_BUNDLE=appimage \
+              UPDATE_KEYS="linux-${UPDATE_ARCH}-appimage linux-${UPDATE_ARCH}" \
+              UPDATE_ARCHIVE_NAME="workbuddy-switch-linux-${UPDATE_ARCH}.AppImage" \
+              UPDATE_JSON_NAME="latest-linux-${UPDATE_ARCH}.json" \
+              BUNDLE_DIR="$LINUX_ROOT/appimage" sh scripts/gen-update-json.sh
+            UPDATE_VERSION="$VER" UPDATE_OS=linux UPDATE_ARCH="$UPDATE_ARCH" UPDATE_BUNDLE=deb \
+              UPDATE_KEYS="linux-${UPDATE_ARCH}-deb" \
+              UPDATE_ARCHIVE_NAME="workbuddy-switch-linux-${UPDATE_ARCH}.deb" \
+              UPDATE_JSON_NAME="latest-linux-deb-${UPDATE_ARCH}.json" \
+              BUNDLE_DIR="$LINUX_ROOT/deb" sh scripts/gen-update-json.sh
+            cp "$LINUX_ROOT/appimage/latest-linux-${UPDATE_ARCH}.json" dist-bin/
+            cp "$LINUX_ROOT/deb/latest-linux-deb-${UPDATE_ARCH}.json" dist-bin/
+            exit 0
+          fi
           if [ "$UPDATE_OS" = "windows" ]; then
             ARCHIVE="$BUNDLE_DIR/XBuddy-Switch_${VER}_x64-setup.exe"
           else
@@ -304,6 +342,9 @@ jobs:
           merge-multiple: true
 
       - name: Merge updater manifests
+        env:
+          # 缺平台是静默故障（Linux 曾因此 18 个版本收不到更新），合并后强制校验键齐全
+          REQUIRED_PLATFORMS: darwin-aarch64,darwin-x86_64,windows-x86_64-nsis,windows-x86_64,linux-x86_64,linux-x86_64-deb,linux-x86_64-appimage
         run: python3 scripts/merge-update-manifests.py artifacts
 
       - name: Upload to GitHub Release

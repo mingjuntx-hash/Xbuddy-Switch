@@ -1,8 +1,9 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CodeBuddyCnIdeStatus, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
+  DisplayField,
   GithubConfig, RateLimitHookStatus, RateLimitsPayload, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
-  SessionLinksPreview, TravelConfig, TravelStatus, VscodeExtStatus, VscodeSessionList,
+  Session, SessionLinkPreviewGroup, SessionLinksPreview, SessionSyncVerdict, SessionGroupClient, SessionGroupSummary, SessionGroupDetail, SessionGroupList, SessionGroupPairPreview, SessionMemberVersionStatus, TravelConfig, TravelStatus, VscodeExtStatus, VscodeSessionList,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
 import { accountVariant, normalizeVariant, variantSupportsCheckin } from "./variant";
@@ -29,8 +30,8 @@ const intlAccountA: AccountMeta = { id: "demo-account-ai-a", uid: "demo-intl-001
 const intlAccountB: AccountMeta = { id: "demo-account-ai-b", uid: "demo-intl-002", email: "intl-b@example.com", nickname: "国际版 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "ai" };
 
 const accounts: AccountMeta[] = [
-  { id: "demo-account-a", uid: "demo-user-001", email: "test-a@example.com", nickname: "测试 A", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
-  { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
+  { id: "demo-account-a", uid: "demo-user-001", email: "test-a@example.com", nickname: "测试 A", phoneNumber: "138 0013 8001", note: "主力账号", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
+  { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", phoneNumber: "138 0013 8002", note: "备用号", displayField: "note", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
   { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
   intlAccountA,
   intlAccountB,
@@ -599,6 +600,141 @@ function demoIdeSessionList(sourceUid: string): VscodeSessionList {
   };
 }
 
+/** 演示用的「会话管理页」会话列表：任务（playground）与空间（按 cwd 分组）两种形态。 */
+function demoAccountSessions(intl: boolean): Session[] {
+  const now = Date.now();
+  const project = intl ? "/Users/demo/WorkBuddy AI/2026-09-18-01-33-29" : "/Users/demo/WorkBuddy/2026-09-18-01-33-29";
+  const repo = intl ? "/Users/demo/projects/intl-app" : "/Users/demo/projects/wb-switch";
+  return [
+    { id: "demo-sess-task-1", title: "整理会话复制文案", cwd: project, updatedAt: now - 1000 * 60 * 8, hasHistory: true, isPlayground: true },
+    { id: "demo-sess-task-2", title: "生成 changelog 草稿", cwd: project, updatedAt: now - 1000 * 60 * 95, hasHistory: true, isPlayground: true },
+    { id: "demo-sess-space-1", title: "跨档复制内核改造", cwd: repo, updatedAt: now - 1000 * 60 * 40, hasHistory: true },
+    { id: "demo-sess-space-2", title: "会话管理页骨架", cwd: repo, updatedAt: now - 1000 * 60 * 60 * 5, hasHistory: true },
+    { id: "demo-sess-space-3", title: "发布前回归检查", cwd: "/Users/demo/Documents/notes", updatedAt: now - 1000 * 60 * 60 * 26, hasHistory: true },
+  ];
+}
+
+/** 会话管理页的副本状态演示项（判定口径与后端 `decide_sync` 一致）。 */
+function demoPreviewGroup(
+  sessionId: string,
+  title: string,
+  verdict: SessionSyncVerdict,
+  extraA: number,
+  extraB: number,
+): SessionLinkPreviewGroup {
+  return {
+    groupId: `demo-group-${sessionId}`,
+    title,
+    cwd: "/Users/demo",
+    verdict,
+    extraA,
+    extraB,
+    common: 10,
+    defaultChecked: verdict === "fastForward",
+    availableModes: verdict === "fastForward" ? ["fastForward"] : verdict === "diverge" ? ["overwrite"] : [],
+    reason: "演示数据",
+    // 演示凭据：让「同步 / 覆盖目标」按钮在演示页可见（点击由 DemoAction 拦截）。
+    previewToken: `demo-token-${sessionId}`,
+    recordCount: { source: 10 + extraA, target: 10 + extraB, baseline: 10 },
+    source: { memberId: `m-src-${sessionId}`, uid: "demo-source", accountId: null, sessionId, state: "active" },
+    target: {
+      memberId: `m-tgt-${sessionId}`,
+      uid: "demo-target",
+      accountId: null,
+      sessionId: `${sessionId}-copy`,
+      state: "active",
+    },
+  };
+}
+
+function buildDemoSessionGroups(
+  client: SessionGroupClient,
+  scope: "cn" | "ai" | null,
+  allAccounts: AccountMeta[],
+): SessionGroupDetail[] {
+  const candidates = allAccounts.filter((account) => {
+    if (client === "codebuddyIde") return accountVariant(account) === scope;
+    return true;
+  });
+  const memberAccounts = candidates.length > 0 ? candidates : allAccounts.slice(0, 2);
+  const scenario = [
+    { title: "跨档复制内核改造", status: "behind" as const, count: 2 },
+    { title: "会话筛选和分页", status: "latest" as const, count: 3 },
+    { title: "整理长时间未完成的任务", status: "diverge" as const, count: 2 },
+    { title: "恢复后历史会话索引", status: "missing" as const, count: 2 },
+  ];
+  return scenario.map((item, groupIndex) => {
+    const groupId = `demo-${client}-${scope ?? "all"}-${groupIndex + 1}`;
+    const selectedAccounts = client === "workbuddy" && item.status === "diverge" && memberAccounts.length >= 5
+      ? [memberAccounts[1], memberAccounts[2], memberAccounts[4], memberAccounts[0], memberAccounts[3]]
+      : Array.from({ length: Math.min(item.count, memberAccounts.length) }, (_, index) => memberAccounts[index]);
+    const sharedBaseScenario = client === "workbuddy" && item.status === "diverge" && selectedAccounts.length === 5;
+    const members = selectedAccounts.map((account, memberIndex) => {
+      let versionStatus: SessionMemberVersionStatus = "latest";
+      let contentState: "ready" | "missing" | "unavailable" = "ready";
+      let reason = "内容与操作来源一致";
+      if (item.status === "behind" && memberIndex > 0) {
+        versionStatus = "behind";
+        reason = "目标账号没有独有改动，来源账号新增 3 条，可以安全同步";
+      } else if (item.status === "diverge") {
+        versionStatus = "diverge";
+        reason = sharedBaseScenario
+          ? memberIndex < 3 ? "与另外两个账号处于相同旧版；两条独立分支都包含此内容" : "从共同旧版新增了内容；与另一条分支的更新不同"
+          : "双方都有更新；覆盖会替换目标账号的完整内容";
+      } else if (item.status === "missing" && memberIndex > 0) {
+        versionStatus = "missing";
+        contentState = "missing";
+        reason = "目标会话正文不存在，无法确认或同步";
+      }
+      return {
+        memberId: `${groupId}-member-${memberIndex + 1}`,
+        accountId: account.id,
+        uid: account.uid ?? `demo-uid-${memberIndex}`,
+        sessionId: `${groupId}-session-${memberIndex + 1}`,
+        accountName: account.nickname || account.email || account.uid || "演示账号",
+        variant: accountVariant(account),
+        linkState: "active" as const,
+        versionStatus,
+        title: item.title,
+        projectLabel: client === "workbuddy" ? "项目 wb-switch" : "工作区 3c1f8a92",
+        updatedAt: Date.now() - (sharedBaseScenario ? memberIndex < 3 ? 8 + memberIndex : memberIndex - 3 : memberIndex + groupIndex * 2) * 1000 * 60 * 37,
+        recordCount: contentState === "ready" ? (sharedBaseScenario ? memberIndex < 3 ? 14 : memberIndex === 3 ? 17 : 19 : item.status === "latest" ? 14 : Math.max(4, 14 - memberIndex * 3)) : null,
+        contentPreview: contentState === "ready" ? [
+          { speaker: "用户", text: item.status === "diverge" ? "整理长期未完成的任务，并确认下一步安排。" : "继续处理这个会话。" },
+          { speaker: "助手", text: sharedBaseScenario ? memberIndex < 3 ? "已整理共同旧版的待跟进事项。" : memberIndex === 3 ? "已补充国内版分支的处理记录。" : "已补充国际版分支的处理记录。" : item.status === "diverge" ? (memberIndex === 0 ? "已整理待跟进事项，建议先处理账号同步与会话列表。" : "已补充测试和发布前检查，建议先核对剩余问题。") : "已记录当前进度。" },
+        ] : [],
+        contentState,
+        reason,
+        canBeSource: contentState === "ready",
+      };
+    });
+    const summary: SessionGroupSummary = {
+      key: `${client}:${scope ?? "all"}:${groupId}`,
+      client,
+      variantScope: scope,
+      groupId,
+      groupVariant: scope ?? members[0].variant,
+      title: item.title,
+      projectLabel: members[0].projectLabel,
+      latestActivityAt: Math.max(...members.map((member) => member.updatedAt)),
+      memberCount: members.length,
+      activeMemberCount: members.length,
+      accountNames: members.map((member) => member.accountName),
+      summaryStatus: item.status,
+      summaryText: item.status === "behind" ? "有副本落后，可安全同步" : item.status === "latest" ? "关联副本内容一致" : sharedBaseScenario ? "3 个账号在共同旧版，另有 2 条独立更新" : item.status === "diverge" ? "多个副本有不同更新，需要选择来源" : "有副本内容缺失",
+      safeSourceMemberId: item.status === "behind" || item.status === "latest" ? members[0].memberId : null,
+      hasSafeSource: item.status === "behind" || item.status === "latest",
+    };
+    const linkedAccountIds = new Set(members.map((member) => member.accountId));
+    return {
+      ...summary,
+      members,
+      addTargets: candidates.filter((account) => !linkedAccountIds.has(account.id)),
+      ...(sharedBaseScenario ? { divergence: { commonMemberIds: members.slice(0, 3).map((member) => member.memberId), branches: members.slice(3).map((member) => [member.memberId]) } } : {}),
+    };
+  });
+}
+
 /** Read-only demo response provider. It never reads or mutates real user data. */
 export function screenshotDemoResponse(command: string, args?: Record<string, unknown>): unknown {
   const demoAccounts = hydratedAccounts();
@@ -609,6 +745,9 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
   const config = rotateConfig();
   const rotateStatus: RotateStatus = { config, cliConfigured: true, activeAccountId: demoAccounts[0].id, activeAccountName: demoAccounts[0].nickname, lastCheckAt: atLocalTime(0, 9, 30), lastSwitchAt: atLocalTime(1, 16, 20) };
   const githubConfig: GithubConfig = { owner: "zhangjia", repo: "wb-switch", proxy: "" };
+  const groupClient = args?.client as SessionGroupClient | undefined;
+  const groupScope = args?.variantScope === "ai" ? "ai" : args?.variantScope === "cn" ? "cn" : null;
+  const demoGroups = groupClient ? buildDemoSessionGroups(groupClient, groupScope, demoAccounts) : [];
   switch (command) {
     // 档位随请求回显：两个档位各有一套演示账号，国际版同样回显「运行中 + 当前账号」。
     case "get_status": {
@@ -626,6 +765,56 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       return { ...appStatus, variant };
     }
     case "get_accounts": return { accounts: demoAccounts };
+    // 会话管理页：按账号返回演示会话；国际版账号给一套不同 cwd，混排时可见档位差异。
+    case "list_account_sessions": {
+      const account = demoAccounts.find((item) => item.id === args?.accountId) ?? demoAccounts[0];
+      return {
+        sessions: demoAccountSessions(account.id === intlAccountA.id),
+        current: account.uid ?? "demo-uid",
+        variant: accountVariant(account),
+      };
+    }
+    case "list_session_groups": {
+      if (!groupClient || (groupClient === "codebuddyIde" && !groupScope) || (groupClient !== "codebuddyIde" && groupScope)) {
+        throw new Error("会话客户端或档位参数无效");
+      }
+      const groups = demoGroups.map(({ members: _members, addTargets: _targets, divergence: _divergence, ...summary }) => summary);
+      return { client: groupClient, variantScope: groupScope, storeStatus: "ready", groups } satisfies SessionGroupList;
+    }
+    case "get_session_group": {
+      if (!groupClient || (groupClient === "codebuddyIde" && !groupScope) || (groupClient !== "codebuddyIde" && groupScope)) {
+        throw new Error("会话客户端或档位参数无效");
+      }
+      const groupId = String(args?.groupId ?? "");
+      const selected = demoGroups.find((group) => group.groupId === groupId);
+      if (!selected) throw new Error("演示会话组不存在");
+      return selected satisfies SessionGroupDetail;
+    }
+    case "preview_session_group_pair": {
+      if (!groupClient || (groupClient === "codebuddyIde" && !groupScope) || (groupClient !== "codebuddyIde" && groupScope)) {
+        throw new Error("会话客户端或档位参数无效");
+      }
+      const group = demoGroups.find((item) => item.groupId === args?.groupId);
+      const sourceMemberId = String(args?.sourceMemberId ?? "");
+      const targetMemberId = String(args?.targetMemberId ?? "");
+      const source = group?.members.find((member) => member.memberId === sourceMemberId);
+      const target = group?.members.find((member) => member.memberId === targetMemberId);
+      if (!group || !source || !target || sourceMemberId === targetMemberId) throw new Error("来源或目标成员无效");
+      const verdict = target.versionStatus === "behind" ? "fastForward" : target.versionStatus === "diverge" ? "diverge" : target.versionStatus === "missing" || target.versionStatus === "unknown" ? "unknown" : "identical";
+      return {
+        client: groupClient,
+        variantScope: groupScope,
+        groupId: group.groupId,
+        sourceMemberId,
+        targetMemberId,
+        verdict,
+        availableModes: verdict === "fastForward" ? ["fastForward"] : verdict === "diverge" ? ["overwrite"] : [],
+        previewToken: verdict === "fastForward" || verdict === "diverge" ? `demo-preview-${group.groupId}-${targetMemberId}` : null,
+        reason: target.reason,
+        recordCount: { source: source.recordCount ?? 0, target: target.recordCount ?? 0, baseline: null },
+        extraTargetCount: verdict === "diverge" ? 2 : 0,
+      } satisfies SessionGroupPairPreview;
+    }
     case "get_codebuddy_cli_status": return cliStatus;
     // 让演示里存在一个「CodeBuddy IDE 当前账号」：否则 IDE 标记与选中态染色（淡紫）在演示里永远不可见。
     // 取第二个账号，使三张卡各自演示一种形态（A 占位行 / B IDE 选中 / C 查看全部）。
@@ -681,6 +870,24 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "list_codebuddy_ide_sessions": return demoIdeSessionList(demoAccounts[0].uid ?? "demo-source");
     case "list_codebuddy_intl_ide_sessions": return demoIdeSessionList(intlAccountA.uid ?? "demo-intl-source");
     // 关联预览：演示库没有复制记录，返回 missing（弹窗默认 tab 会拉一次；不得落到「演示模式不可操作」）。
+    // 会话管理页的副本状态（演示）：三条会话分别展示「目标落后 / 已一致 / 两边都有改动」。
+    case "session_links_preview_cross": {
+      const source = demoAccounts.find((account) => account.id === args?.sourceAccountId) ?? demoAccounts[0];
+      const target = demoAccounts.find((account) => account.id === args?.targetAccountId) ?? demoAccounts[1] ?? demoAccounts[0];
+      return {
+        supported: true,
+        storeStatus: "ready",
+        sourceUid: source.uid ?? "demo-source",
+        targetUid: target.uid ?? "demo-target",
+        sourceVariant: accountVariant(source),
+        targetVariant: accountVariant(target),
+        groups: [
+          demoPreviewGroup("demo-sess-space-1", "跨档复制内核改造", "fastForward", 3, 0),
+          demoPreviewGroup("demo-sess-space-2", "会话管理页骨架", "identical", 0, 0),
+          demoPreviewGroup("demo-sess-task-1", "整理会话复制文案", "diverge", 4, 2),
+        ],
+      } satisfies SessionLinksPreview;
+    }
     case "codebuddy_ide_session_links_preview":
     case "codebuddy_intl_ide_session_links_preview":
     case "vscode_session_links_preview": {
@@ -698,6 +905,18 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       if (!target) throw new Error("账号不存在");
       demoActiveCliAccountId = target.id;
       return { ok: true, configured: true, synced: true, verified: true, activeIndex: demoAccounts.indexOf(target), activeAccountId: target.id, regionChanged: false, cliClosed: false, closedProcessCount: 0, message: "演示切换已完成" } satisfies CodeBuddyCliSwitchResult;
+    }
+    // 写操作：演示模式下直接改内存里的演示账号，保存后卡片/弹框立即可见。
+    case "update_account_display": {
+      const target = accounts.find((account) => account.id === args?.accountId);
+      if (!target) throw new Error("账号不存在");
+      const patch = (args?.patch ?? {}) as { note?: string | null; displayField?: DisplayField };
+      if ("note" in patch) {
+        const trimmed = typeof patch.note === "string" ? patch.note.trim() : "";
+        target.note = trimmed || null;
+      }
+      if (patch.displayField) target.displayField = patch.displayField;
+      return { ok: true, account: { ...target } };
     }
     case "get_checkin_status": return { ok: true, todayCheckedIn: true };
     case "get_credit_expiry": return creditExpiry(String(args?.accountId ?? ""));

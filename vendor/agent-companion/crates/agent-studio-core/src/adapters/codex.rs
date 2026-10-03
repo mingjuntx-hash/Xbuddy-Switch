@@ -1,6 +1,6 @@
 // Codex is event-driven: no database, transcript, or persisted-session reads.
 use super::*;
-use crate::{content, merge, question_tool};
+use crate::{content, merge, question, question_reply_ids, question_tool, questions, text};
 use std::hash::{Hash, Hasher};
 
 fn internal_prompt(prompt: &str) -> bool {
@@ -128,6 +128,31 @@ impl Collector {
         if let Some(cwd) = p["cwd"].as_str().filter(|s| !s.is_empty()) {
             state["cwd"] = json!(cwd);
         }
+        let prompt = content(&p["prompt"]);
+        let trimmed = prompt.trim();
+        // Real prompts clear Hub optional waits, not just the per-round call
+        // map: PostToolUse marks async calls resolved, and that map is then
+        // pruned, while the question can still be pending.
+        let optional_ids: Vec<String> = if event == "UserPromptSubmit"
+            && !trimmed.is_empty()
+            && !trimmed.starts_with('<')
+        {
+            self.hub
+                .sessions
+                .get(&format!("codex:{sid}"))
+                .and_then(|session| session["pending"].as_array())
+                .map(|pending| {
+                    pending
+                        .iter()
+                        .filter(|item| item["optional"] == true)
+                        .map(|item| text(&item["id"]))
+                        .filter(|id| !id.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let base =
             json!({"source":"codex","sessionId":sid,"cwd":state["cwd"],"roundId":round,"ts":ts});
         let mut emit = |ev| self.hub.ingest(merge(base.clone(), ev));
@@ -150,18 +175,34 @@ impl Collector {
         };
         match event.as_str() {
             "UserPromptSubmit" => {
-                // Prompt text is a hook-provided label, not the database conversation title.
-                let title = content(&p["prompt"]);
-                if !title.trim().is_empty() {
-                    emit(json!({"type":"meta","title":title}));
+                if trimmed.starts_with("<send_user_message_question_reply>") {
+                    // Answers clear their exact call and never become a session title.
+                    for call in question_reply_ids(&prompt) {
+                        emit(json!({"type":"resolve","callId":call}));
+                    }
+                } else if trimmed.starts_with('<') {
+                    // Other internal envelopes (browser context, environment) neither
+                    // title the session nor answer a question.
+                } else if !trimmed.is_empty() {
+                    for call in &optional_ids {
+                        emit(json!({"type":"resolve","callId":call}));
+                    }
+                    // Prompt text is a hook-provided label, not the database conversation title.
+                    emit(json!({"type":"meta","title":prompt}));
                 }
             }
             "PreToolUse" => {
                 if !id.is_empty() && state["calls"][&id]["resolved"] != true {
-                    state["calls"][&id] = json!({"tool":tool,"command":command,"resolved":false,"async":tool.ends_with("request_user_input_async"),"ts":ts});
-                    // Optional async questions do not block the Codex turn.
-                    if question_tool(&tool) && !tool.ends_with("request_user_input_async") {
-                        emit(json!({"type":"wait","callId":id,"tool":tool,"text":"需要你确认"}));
+                    let optional = tool.ends_with("request_user_input_async");
+                    state["calls"][&id] = json!({"tool":tool,"command":command,"resolved":false,"async":optional,"ts":ts});
+                    if question_tool(&tool) {
+                        let mut ev = json!({"type":"wait","callId":id,"tool":tool,"text":question(&input),"questions":questions(&input)});
+                        // Async questions never block the Codex turn, so the Hub
+                        // expires them on its own clock.
+                        if optional {
+                            ev["optional"] = json!(true);
+                        }
+                        emit(ev);
                     } else {
                         emit(json!({"type":"step","eventId":id,"label":tool}));
                     }
@@ -205,8 +246,8 @@ impl Collector {
                     let is_async = state["calls"][&id]["async"] == true
                         || tool.ends_with("request_user_input_async");
                     state["calls"][&id] = json!({"tool":tool,"command":command,"resolved":true,"async":is_async,"ts":ts});
-                    // Async questions never create waits, so their completion must
-                    // not resolve any pending synchronous question.
+                    // An async question returns before the user answers, so its
+                    // completion must not resolve any pending question.
                     if !is_async {
                         emit(json!({"type":"resolve","callId":id}));
                     }

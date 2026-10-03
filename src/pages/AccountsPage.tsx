@@ -17,6 +17,7 @@ import {
 import { AccountCard } from "@/components/account-card";
 import { AccountNoteChip, accountNote } from "@/components/account-note-chip";
 import { AccountNoteDialog } from "@/components/account-note-dialog";
+import { AccountInfoDialog } from "@/components/account-info-dialog";
 import { JetbrainsSwitchDialog } from "@/components/jetbrains-switch-dialog";
 import { CodebuddyIdeSwitchAccountDialog } from "@/components/codebuddy-ide-switch-account-dialog";
 import { DemoAction } from "@/components/demo-action";
@@ -51,7 +52,6 @@ import { VscodeSwitchAccountDialog } from "@/components/vscode-switch-account-di
 import * as api from "@/lib/api";
 import { useVisibleInterval } from "@/lib/use-visible-interval";
 import {
-  DEFAULT_VARIANT,
   accountVariant,
   normalizeVariant,
   variantAppName,
@@ -63,7 +63,8 @@ import {
   variantUsesIntlCodebuddyIde,
 } from "@/lib/variant";
 import { useSupportedTools } from "@/lib/supported-tools";
-import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, JetbrainsStatus, RateLimitEntry, TravelConfig, TravelStatus, VscodeExtStatus } from "@/lib/types";
+import type { AccountMeta, AppStatus, CheckinConfig, CreditExpiry, RateLimitEntry, TravelConfig, TravelStatus } from "@/lib/types";
+import { displayName } from "@/lib/account-display";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -77,6 +78,15 @@ import { useAccountsStore } from "@/stores/accounts";
  */
 const TRAVEL_REFRESH_INTERVAL_MS = 60 * 1000;
 const RATE_LIMIT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+/**
+ * CodeBuddy CLI 认证状态的重读间隔。
+ *
+ * 保活刷新会先批量改写账号库里的 token、再把新 token 同步回
+ * `~/.codebuddy/settings.json`。这个窗口里状态判定会短暂认为「认证已脱节」。
+ * 后端在刷新前后各广播一次 `codebuddy-cli-updated`（见 lib.rs 保活循环），
+ * 这里再挂一个可见时轮询兜底：即使事件因窗口未挂载而错过，横幅也会自行收掉。
+ */
+const CLI_STATUS_REFRESH_INTERVAL_MS = 30 * 1000;
 
 function expiringSoonAmount(credit?: CreditExpiry): number {
   return credit?.ok ? credit.expiringSoonRemaining ?? 0 : 0;
@@ -175,12 +185,17 @@ export default function AccountsPage() {
     refreshingCredits,
     ensureCredits,
     refreshCredits,
+    clientStatus,
+    setClientStatus,
   } = useAccountsStore();
   const [oauthOpen, setOauthOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
-  const [switchAccount, setSwitchAccount] = useState<AccountMeta | null>(null);
+  /** 「导入本机账号」进行中（XBuddy 分支保留了上游移除的这个入口）。 */
   const [importing, setImporting] = useState(false);
+  const [switchAccount, setSwitchAccount] = useState<AccountMeta | null>(null);
+  /** 「账号信息」弹框目标账号（查看信息 / 编辑备注 / 选择显示字段）。 */
+  const [infoTarget, setInfoTarget] = useState<AccountMeta | null>(null);
   /**
    * 自动签到配置（只读）：只用于决定账号卡片是否展示「自动签到已关闭」chip，
    * 以及状态查询、刷新时跳过哪些账号。控制入口在设置页。
@@ -204,15 +219,17 @@ export default function AccountsPage() {
    * `null` = 配置尚未读到，不得按默认 true 先扫一轮（关闭开关后进账号页会闪 chip / 误请求）。
    */
   const [rateLimitEnabled, setRateLimitEnabled] = useState<boolean | null>(null);
-  const [codebuddyCli, setCodebuddyCli] = useState<CodeBuddyCliStatus | null>(null);
+  /**
+   * 各客户端状态（CLI / CodeBuddy IDE / VS Code / JetBrains）放在 store 里：
+   * 账号页每次进入都会重挂载，局部 state 会被重置为 `null`，界面先按「未接入」
+   * 渲染、等状态探测回来才改口（issue #84）。store 里则先按上次结果渲染。
+   */
+  const { codebuddyCli, codebuddyCnIde, vscodeExt, jetbrains } = clientStatus;
   const [codebuddyCliSwitchingId, setCodebuddyCliSwitchingId] = useState<string | null>(null);
-  const [codebuddyCnIde, setCodebuddyCnIde] = useState<CodeBuddyCnIdeStatus | null>(null);
   /** CodeBuddy IDE 切换弹窗目标（null=关闭）；切换与可选会话复制/同步在弹窗内完成（国内版 / 国际版共用）。 */
   const [codebuddyIdeSwitchAccount, setCodebuddyIdeSwitchAccount] = useState<AccountMeta | null>(null);
-  const [vscodeExt, setVscodeExt] = useState<VscodeExtStatus | null>(null);
   /** VS Code 扩展切换弹窗目标（null=关闭）；切换与可选会话复制在弹窗内完成。 */
   const [vscodeSwitchAccount, setVscodeSwitchAccount] = useState<AccountMeta | null>(null);
-  const [jetbrains, setJetbrains] = useState<JetbrainsStatus | null>(null);
   /** JetBrains 切换弹窗目标（null=关闭）；切换与目标 IDE 选择在弹窗内完成。 */
   const [jetbrainsSwitchTarget, setJetbrainsSwitchTarget] = useState<AccountMeta | null>(null);
   const [installingCodebuddyCli, setInstallingCodebuddyCli] = useState(false);
@@ -300,55 +317,39 @@ export default function AccountsPage() {
     };
   }, []);
 
-  /**
-   * 首次启动自动导入本机账号（本会话只尝试一次，无本机账号时静默）。
-   * 仅限默认档位：切到国际版时不静默写入账号，改由空状态引导显式导入或浏览器授权登录。
-   */
-  const autoImportTried = useRef(false);
-  useEffect(() => {
-    if (variant !== DEFAULT_VARIANT) return;
-    if (autoImportTried.current || loading || visibleAccounts.length > 0) return;
-    autoImportTried.current = true;
-    void importLocal()
-      .then(() => void fetchAll())
-      .catch(() => {
-        /* 本机无 WorkBuddy 登录态时静默，不打扰用户 */
-      });
-  }, [variant, visibleAccounts.length, loading, importLocal, fetchAll]);
-
   async function refreshCodebuddyCliStatus() {
     try {
-      setCodebuddyCli(await api.getCodebuddyCliStatus());
+      setClientStatus({ codebuddyCli: await api.getCodebuddyCliStatus() });
     } catch {
-      setCodebuddyCli(null);
+      setClientStatus({ codebuddyCli: null });
     }
   }
 
   async function refreshCodebuddyCnIdeStatus() {
     try {
-      setCodebuddyCnIde(
-        variantUsesIntlCodebuddyIde(variant)
+      setClientStatus({
+        codebuddyCnIde: variantUsesIntlCodebuddyIde(variant)
           ? await api.getCodebuddyIdeStatus()
           : await api.getCodebuddyCnIdeStatus(),
-      );
+      });
     } catch {
-      setCodebuddyCnIde(null);
+      setClientStatus({ codebuddyCnIde: null });
     }
   }
 
   async function refreshVscodeExtStatus() {
     try {
-      setVscodeExt(await api.getVscodeExtStatus());
+      setClientStatus({ vscodeExt: await api.getVscodeExtStatus() });
     } catch {
-      setVscodeExt(null);
+      setClientStatus({ vscodeExt: null });
     }
   }
 
   async function refreshJetbrainsStatus() {
     try {
-      setJetbrains(await api.getJetbrainsStatus());
+      setClientStatus({ jetbrains: await api.getJetbrainsStatus() });
     } catch {
-      setJetbrains(null);
+      setClientStatus({ jetbrains: null });
     }
   }
 
@@ -356,7 +357,25 @@ export default function AccountsPage() {
     let cancelled = false;
     // 支持工具关闭的端：既不探测也不轮询（与入口隐藏保持一致，省掉无谓请求）。
     if (enabledTools.codebuddyCli) void refreshCodebuddyCliStatus();
+
+    /**
+     * 读各端状态（安装 / 运行 / 当前账号）：只读本地状态文件与进程，不碰钥匙串，
+     * 因此不必等下面的本机登录探测。
+     */
+    async function refreshClientStatuses() {
+      if (cancelled) return;
+      if (enabledTools.codebuddyIde) await refreshCodebuddyCnIdeStatus();
+      if (cancelled) return;
+      if (enabledTools.vscodeExt) await refreshVscodeExtStatus();
+      if (cancelled) return;
+      if (enabledTools.jetbrains) await refreshJetbrainsStatus();
+    }
+
     void (async () => {
+      // 状态刷新与登录探测并行起跑：探测要读钥匙串 / Safe Storage / 注册表 / 进程
+      // （macOS 可能等待系统授权、Windows 走 PowerShell，耗时可达数秒），排在状态
+      // 前面会让「已接入」迟迟不显示（issue #84）。
+      const statuses = refreshClientStatuses();
       if (!api.isDemoMode()) {
         if (enabledTools.codebuddyIde) {
           try {
@@ -385,11 +404,9 @@ export default function AccountsPage() {
           }
         }
       }
-      if (!cancelled) {
-        if (enabledTools.codebuddyIde) await refreshCodebuddyCnIdeStatus();
-        if (enabledTools.vscodeExt) await refreshVscodeExtStatus();
-        if (enabledTools.jetbrains) await refreshJetbrainsStatus();
-      }
+      await statuses;
+      // 探测命中账号时后端会把「当前账号」写回本地状态，再读一次让高亮跟上。
+      if (!cancelled) await refreshClientStatuses();
     })();
     return () => {
       cancelled = true;
@@ -485,6 +502,11 @@ export default function AccountsPage() {
   const loadRateLimitsRef = useRef(loadRateLimits);
   loadRateLimitsRef.current = loadRateLimits;
 
+  // 事件监听与定时器都需要「最新」的刷新函数：直接闭包捕获会在状态更新后仍然
+  // 指向旧引用，导致拉回的仍是挂载时的旧判断。
+  const refreshCodebuddyCliStatusRef = useRef(refreshCodebuddyCliStatus);
+  refreshCodebuddyCliStatusRef.current = refreshCodebuddyCliStatus;
+
   // 兜底轮询：页面可见且距上次扫描 ≥ 5 分钟时拉一次（IDE 日志扫描在后端按同一间隔节流）。
   // 图标何时消失由卡片本地按 `resetAt` 每秒判定（跨过官方重置时刻自动消失），不依赖这里的轮询。
   useVisibleInterval(
@@ -505,6 +527,31 @@ export default function AccountsPage() {
     });
     return () => unlisten?.();
   }, []);
+
+  /**
+   * CLI 认证状态变化（保活刷新前后、切换账号、接入 helper）→ 立即重读。
+   *
+   * 没有这一路时，页面只在挂载时读一次状态：若恰好落在保活刷新的中间态，
+   * 判出来的「认证已脱节」会一直留在页面上，用户点什么都要等下次重挂载。
+   */
+  useEffect(() => {
+    if (api.isWebui()) return;
+    let unlisten: (() => void) | undefined;
+    void listen("codebuddy-cli-updated", () => {
+      void refreshCodebuddyCliStatusRef.current();
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, []);
+
+  // 兜底轮询：事件可能因窗口尚未挂载而错过（例如后台刷新先于页面加载完成），
+  // 仅主窗口可见时执行，保证横幅最终一定会自愈。
+  useVisibleInterval(
+    () => void refreshCodebuddyCliStatusRef.current(),
+    CLI_STATUS_REFRESH_INTERVAL_MS,
+    true,
+  );
 
   // 「限额监听」开关（设置页）：关闭后不再发起扫描；开关状态来自后端配置文件，
   // 设置页改完返回账号页会重新挂载并读到新值。
@@ -576,11 +623,20 @@ export default function AccountsPage() {
     toast.success("导出成功", { description: text });
   }
 
-  /** 导入完成提示：计数 + token 可能过期提醒，并刷新列表。 */
-  function onImported(result: { imported: number; skipped: number; overwritten: number }) {
+  /** 导入完成提示：计数 + token 可能过期提醒（含加密凭据能力限制），并刷新列表。 */
+  function onImported(result: {
+    imported: number;
+    skipped: number;
+    overwritten: number;
+    encrypted: number;
+  }) {
     void fetchAll();
     const overwriteText = result.overwritten > 0 ? `（覆盖 ${result.overwritten} 个）` : "";
-    const text = `已导入 ${result.imported} 个${overwriteText}，跳过 ${result.skipped} 个。token 可能已过期，切换后可能需要重新登录。`;
+    const encryptedText =
+      result.encrypted > 0
+        ? `其中 ${result.encrypted} 个为加密凭据，仅可用于切换，签到/积分不可用。`
+        : "";
+    const text = `已导入 ${result.imported} 个${overwriteText}，跳过 ${result.skipped} 个。${encryptedText}token 可能已过期，切换后可能需要重新登录。`;
     toast.success("导入成功", { description: text });
   }
 
@@ -610,7 +666,7 @@ export default function AccountsPage() {
           : res.result === "already"
             ? "今天已签到"
             : "签到失败";
-      const description = `${a.nickname || a.email || a.id}${res.error ? `：${res.error}` : ""}`;
+      const description = `${displayName(a)}${res.error ? `：${res.error}` : ""}`;
       if (res.result === "error") toast.error(label, { description });
       else toast.success(label, { description });
       // 手动签到已完成状态核验，直接使用回执，避免为已关闭账号再触发展示查询。
@@ -628,7 +684,7 @@ export default function AccountsPage() {
   async function onRefresh(a: AccountMeta) {
     try {
       const res = await api.refreshAccountToken(a.id);
-      const label = a.nickname || a.email || a.id;
+      const label = displayName(a);
       if (res.needsRelogin) {
         toast.error("Token 刷新失败", { description: `${label}：需重新登录${res.needsReloginReason ? `（${res.needsReloginReason}）` : ""}` });
       } else {
@@ -710,7 +766,7 @@ export default function AccountsPage() {
     setCliSwitchTarget(null);
     setCodebuddyCliSwitchingId(account.id);
     const toastId = toast.loading("正在切换 CodeBuddy CLI…", {
-      description: `正在将默认账号设为 ${account.nickname || account.email || account.id}`,
+      description: `正在将默认账号设为 ${displayName(account)}`,
     });
     try {
       // 后端一律先关闭正在运行的 CLI 再写状态（`closeRunningCli` 入参已废弃）。
@@ -718,7 +774,7 @@ export default function AccountsPage() {
       await refreshCodebuddyCliStatus();
       toast.success("CodeBuddy CLI 默认账号已更新", {
         id: toastId,
-        description: `${account.nickname || account.email || account.id}：${result.message || "配置已更新"}`,
+        description: `${displayName(account)}：${result.message || "配置已更新"}`,
       });
     } catch (error) {
       toast.error("CodeBuddy CLI 切换失败", {
@@ -784,14 +840,10 @@ export default function AccountsPage() {
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
       : undefined;
   const cliCurrentAccountId = codebuddyCli?.activeAccountId;
-  const cliSwitchAccountLabel = cliSwitchTarget
-    ? cliSwitchTarget.nickname || cliSwitchTarget.email || cliSwitchTarget.id
-    : "";
+  const cliSwitchAccountLabel = cliSwitchTarget ? displayName(cliSwitchTarget) : "";
   /** CLI 切换确认弹窗里也带上备注：切换会中断当前 CLI 会话，切错成本比其它端更高。 */
   const cliSwitchNote = accountNote(cliSwitchTarget);
-  const workbuddyCurrentName = current
-    ? current.nickname || current.email || current.uid || "未知账号"
-    : "未登录";
+  const workbuddyCurrentName = current ? displayName(current) : "未登录";
   const codebuddyCurrentName = codebuddyCli?.configured
     ? codebuddyCli.activeAccountName || "未检测到"
     : "尚未接入";
@@ -975,7 +1027,8 @@ export default function AccountsPage() {
         (!codebuddyCli.configured ||
           (!codebuddyUsesSettingsEnv && !codebuddyCli.helperSupportsAccountIds) ||
           codebuddyCli.migrationRequired ||
-          codebuddyCli.syncPending) && (
+          codebuddyCli.syncPending ||
+          codebuddyCli.syncInProgress) && (
         <Alert className="mb-4">
           <Terminal />
           <AlertTitle>CodeBuddy CLI 接入</AlertTitle>
@@ -986,29 +1039,35 @@ export default function AccountsPage() {
                   ? "检测到进程环境变量 CODEBUDDY_AUTH_TOKEN。它会覆盖 settings.json；请先从 Windows 用户或系统环境变量中删除它，再重启本应用与 CodeBuddy CLI。"
                   : codebuddyCli.syncPending
                     ? "Windows CLI 认证配置与当前账号 Token 已脱节。点击更新认证后写入最新 Token；当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
-                    : codebuddyCli.migrationRequired
-                      ? "检测到旧版 Windows helper 配置。接入后会改用 settings.json 的 env.CODEBUDDY_AUTH_TOKEN，不再执行 helper。"
-                      : "Windows 使用 CodeBuddy settings.json 中的认证 Token。保活刷新只更新后续启动使用的 Token；切换账号会先关闭正在运行的 CodeBuddy CLI，重新打开 CLI 后即用新账号。"
+                    : codebuddyCli.syncInProgress
+                      ? "保活刷新已更新账号 Token，正在同步到 CodeBuddy CLI 认证配置。稍候会自动完成，无需操作。"
+                      : codebuddyCli.migrationRequired
+                        ? "检测到旧版 Windows helper 配置。接入后会改用 settings.json 的 env.CODEBUDDY_AUTH_TOKEN，不再执行 helper。"
+                        : "Windows 使用 CodeBuddy settings.json 中的认证 Token。保活刷新只更新后续启动使用的 Token；切换账号会先关闭正在运行的 CodeBuddy CLI，重新打开 CLI 后即用新账号。"
                 : codebuddyCli.migrationRequired
                   ? "检测到旧版 helper，请先升级；升级前不会将 CLI 切换显示为已验证。"
                   : codebuddyCli.configured
                     ? "当前 helper 仍按旧索引读取账号；升级后将按账号 ID 独立切换，账号增删也不会错位。"
                     : "WorkBuddy 账号与积分功能可正常使用；如需从这里切换 CodeBuddy CLI 账号，点击下方按钮一键接入。"}
             </p>
-            <DemoAction>
-              <Button
-                className="mt-2"
-                size="sm"
-                variant="outline"
-                onClick={() => void onInstallCodebuddyCli()}
-                disabled={installingCodebuddyCli}
-              >
-                {installingCodebuddyCli && <Loader2 className="animate-spin" />}
-                {codebuddyUsesSettingsEnv
-                  ? codebuddyCli.configured ? "更新 CLI 认证" : "接入 CLI"
-                  : codebuddyCli.configured || codebuddyCli.migrationRequired ? "升级 CLI helper" : "接入 CLI"}
-              </Button>
-            </DemoAction>
+            {/* 同步进行中是正常的中间态：给状态说明但不逼用户点按钮，
+                否则用户会在刷新未完成时重复触发写入。 */}
+            {!codebuddyCli.syncInProgress && (
+              <DemoAction>
+                <Button
+                  className="mt-2"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void onInstallCodebuddyCli()}
+                  disabled={installingCodebuddyCli}
+                >
+                  {installingCodebuddyCli && <Loader2 className="animate-spin" />}
+                  {codebuddyUsesSettingsEnv
+                    ? codebuddyCli.configured ? "更新 CLI 认证" : "接入 CLI"
+                    : codebuddyCli.configured || codebuddyCli.migrationRequired ? "升级 CLI helper" : "接入 CLI"}
+                </Button>
+              </DemoAction>
+            )}
           </AlertDescription>
         </Alert>
       )}
@@ -1075,12 +1134,12 @@ export default function AccountsPage() {
               <>
                 <p>暂无国际版账号。</p>
                 <p className="mt-2 text-xs leading-5">
-                  请确认本机已安装 {appName}（客户端下载域名 {variantDownloadDomain(variant)}）并登录，
-                  再点击上方「导入本机国际版账号」；也可以直接「OAuth 登录」添加国际版账号。
+                  点击上方「OAuth 登录」添加账号；本机已登录的账号也请一并添加，以便随时切回。
+                  切换前请确认本机已安装 {appName}（客户端下载域名 {variantDownloadDomain(variant)}）。
                 </p>
               </>
             ) : (
-              "暂无账号。点击上方按钮导入本机账号或扫码登录。"
+              "暂无账号。点击上方「OAuth 扫码添加」接入账号；本机已登录的账号也请一并添加，以便随时切回。"
             )}
           </div>
         ) : (
@@ -1095,6 +1154,7 @@ export default function AccountsPage() {
                 onDelete={onDelete}
                 onEditNote={setNoteTarget}
                 onSwitch={setSwitchAccount}
+                onShowInfo={setInfoTarget}
                 onCheckin={checkinAvailable ? onCheckin : undefined}
                 onRefresh={onRefresh}
                 todayCheckedIn={checkinMap[a.id]}
@@ -1106,7 +1166,7 @@ export default function AccountsPage() {
                 creditUpdatedAt={creditUpdatedAtMap[a.id]}
                 creditPriority={a.id === priorityAccountId}
                 workbuddyActive={enabledTools.workbuddy && isWorkbuddyCurrent(a, current)}
-                codebuddyCliConfigured={codebuddyCli?.configured && !codebuddyCli.migrationRequired && !codebuddyCli.syncPending}
+                codebuddyCliConfigured={codebuddyCli?.configured && !codebuddyCli.migrationRequired && !codebuddyCli.syncPending && !codebuddyCli.syncInProgress}
                 codebuddyCliActive={enabledTools.codebuddyCli && a.id === cliCurrentAccountId}
                 codebuddyCliBusy={codebuddyCliSwitchingId !== null}
                 onSwitchCodebuddyCli={onSwitchCodebuddyCli}
@@ -1168,6 +1228,16 @@ export default function AccountsPage() {
           void fetchAll();
           void refreshCodebuddyCliStatus();
           void refreshCodebuddyCnIdeStatus();
+        }}
+      />
+      <AccountInfoDialog
+        open={infoTarget !== null}
+        onOpenChange={(o) => {
+          if (!o) setInfoTarget(null);
+        }}
+        account={infoTarget}
+        onSaved={() => {
+          void fetchAll();
         }}
       />
       <CodebuddyIdeSwitchAccountDialog
@@ -1272,7 +1342,7 @@ export default function AccountsPage() {
           <DialogHeader>
             <DialogTitle>删除账号</DialogTitle>
             <DialogDescription>
-              确定删除账号「{deleteTarget?.nickname || deleteTarget?.email || deleteTarget?.id}」？
+              确定删除账号「{deleteTarget ? displayName(deleteTarget) : ""}」？
               此操作不可撤销。
             </DialogDescription>
           </DialogHeader>

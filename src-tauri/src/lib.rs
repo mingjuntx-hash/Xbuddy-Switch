@@ -37,6 +37,22 @@ pub(crate) fn deliver_rotate_notify(app: &tauri::AppHandle, result: &serde_json:
     }
 }
 
+/// 广播「CodeBuddy CLI 认证状态可能已变」，让前端立即重读。
+///
+/// 保活刷新会先批量改写账号库里的 token、再异步同步回 `settings.json`；这个窗口里
+/// 状态接口会短暂读到「账号库已换新、settings 未跟上」。刷新前后各广播一次，
+/// 前端就能把旧判断及时收敛，而不是等下一次页面重挂载。
+pub(crate) fn notify_codebuddy_cli_updated(app: &tauri::AppHandle) {
+    #[cfg(desktop)]
+    {
+        let _ = app.emit("codebuddy-cli-updated", ());
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = app;
+    }
+}
+
 /// 后台循环：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
 /// 签到时间段时固定 30 分钟）；自动轮换每 30 秒检查；每天一次保活；
 /// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
@@ -99,7 +115,13 @@ fn spawn_background_loops(app: tauri::AppHandle) {
             let today = modules::checkin::date_str(None);
             if today != last_keepalive_day {
                 last_keepalive_day = today;
+                // 保活会批量改写 `access_token` 并同步回 settings.json，期间前端若拉到
+                // 状态会读到「账号库已换新、settings 未跟上」的中间态。刷新前后各广播
+                // 一次：先让前端把已显示的旧判断标记为「同步中」，刷新完再让它重读，
+                // 避免误判的告警滞留在页面上。
+                notify_codebuddy_cli_updated(&rotate_app);
                 let _ = modules::refresh::run_keepalive_cycle().await;
+                notify_codebuddy_cli_updated(&rotate_app);
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
@@ -211,6 +233,7 @@ pub fn run() {
             commands::detect_jetbrains_account,
             commands::delete_account,
             commands::set_account_note,
+            commands::update_account_display,
             commands::oauth_start,
             commands::oauth_status,
             commands::import_local,
@@ -220,8 +243,23 @@ pub fn run() {
             commands::import_accounts,
             commands::switch_account,
             commands::list_sessions,
+            commands::list_account_sessions,
             commands::copy_sessions,
+            commands::copy_sessions_cross,
             commands::session_links_preview,
+            commands::session_links_preview_cross,
+            commands::session_sync_cross,
+            commands::list_session_groups,
+            commands::get_session_group,
+            commands::preview_session_group_pair,
+            commands::sync_session_group_pair,
+            commands::sync_session_group_unify,
+            commands::sync_session_group_safe_batch,
+            commands::add_session_group_member,
+            commands::copy_linked_sessions,
+            commands::vscode_restart_precheck,
+            commands::unlink_session_group_member,
+            commands::delete_session_group,
             commands::open_permission_settings,
             commands::check_auth_permission,
             commands::reveal_app_in_finder,

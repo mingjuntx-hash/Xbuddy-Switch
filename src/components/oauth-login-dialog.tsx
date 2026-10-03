@@ -12,6 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
 import { DEFAULT_VARIANT, variantAppName, variantLabel } from "@/lib/variant";
 import type { AccountMeta, WbVariant } from "@/lib/types";
@@ -214,7 +215,7 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
         {result && (
           <Alert>
             <AlertDescription>
-              已采集账号：{result.nickname || result.email || result.id}
+              已采集账号：{displayName(result)}
             </AlertDescription>
           </Alert>
         )}

@@ -55,24 +55,40 @@ try {
     for(let i=0;i<30;i++){state=await rpc('poll',{client:'wb-switch'});if(state.snapshot.sessions.find(s=>s.sessionId==='question')?.status===status)break;await delay(100);}
     assert.equal(state.snapshot.sessions.find(s=>s.sessionId==='question').status,status);
   }
-  // A trailing step proves the queued async callbacks have reached the collector.
-  for (const event of ['UserPromptSubmit','PreToolUse','PostToolUse']) {
-    execFileSync(hook,['hook','--home',home],{input:JSON.stringify({session_id:'optional-question',turn_id:'optional',hook_event_name:event,tool_name:'functions.request_user_input_async',tool_use_id:'optional-1',tool_input:{questions:[{title:'Optional preference'}]},tool_response:{accepted:true}})});
-  }
-  execFileSync(hook,['hook','--home',home],{input:JSON.stringify({session_id:'optional-question',turn_id:'optional',hook_event_name:'PreToolUse',tool_name:'Bash',tool_use_id:'after-optional'})});
+  // An async question is a real wait: it notifies once, its own completion
+  // cannot clear it, the answer envelope clears it by call id without touching
+  // the title, and a trailing real prompt clears whatever is still unanswered.
+  execFileSync(hook,['hook','--home',home],{input:JSON.stringify({session_id:'optional-question',turn_id:'optional',hook_event_name:'UserPromptSubmit',prompt:'Optional run'})});
+  execFileSync(hook,['hook','--home',home],{input:JSON.stringify({session_id:'optional-question',turn_id:'optional',hook_event_name:'PreToolUse',tool_name:'functions.request_user_input_async',tool_use_id:'optional-1',tool_input:{questions:[{title:'Optional preference',options:[{label:'保持'}]}]}})});
   const optionalAlerts=[];
   for(let i=0;i<30;i++) {
     state=await rpc('poll',{client:'wb-switch'});
     optionalAlerts.push(...state.notifications);
-    if(state.snapshot.sessions.find(s=>s.sessionId==='optional-question')?.steps.some(s=>s.id==='after-optional'))break;
+    if(state.snapshot.sessions.find(s=>s.sessionId==='optional-question')?.status==='wait')break;
     await delay(100);
   }
-  const optional=state.snapshot.sessions.find(s=>s.sessionId==='optional-question');
-  assert(optional?.steps.some(s=>s.id==='after-optional'));
+  let optional=state.snapshot.sessions.find(s=>s.sessionId==='optional-question');
+  assert.equal(optional.status,'wait');
+  assert.equal(optional.pending.length,1);
+  assert.equal(optional.pending[0].optional,true);
+  assert.equal(optional.pending[0].text,'Optional preference');
+  assert.equal(optional.title,'Optional run');
+  assert.equal(optionalAlerts.filter(a=>a.sessionId==='codex:optional-question'&&a.kind==='wait').length,1);
+  assert.equal((await rpc('poll',{client:'wb-switch'})).notifications.length,0);
+  execFileSync(hook,['hook','--home',home],{input:JSON.stringify({session_id:'optional-question',turn_id:'optional',hook_event_name:'PostToolUse',tool_name:'functions.request_user_input_async',tool_use_id:'optional-1',tool_response:{accepted:true}})});
+  const optionalReply=`<send_user_message_question_reply>\n${JSON.stringify([{questionItemId:JSON.stringify(['functions.request_user_input_async','optional-1',0]),answer:'保持'}])}\n</send_user_message_question_reply>`;
+  execFileSync(hook,['hook','--home',home],{input:JSON.stringify({session_id:'optional-question',turn_id:'optional',hook_event_name:'UserPromptSubmit',prompt:optionalReply})});
+  for(let i=0;i<30;i++){state=await rpc('poll',{client:'wb-switch'});if(!state.snapshot.sessions.find(s=>s.sessionId==='optional-question')?.pending.length)break;await delay(100);}
+  optional=state.snapshot.sessions.find(s=>s.sessionId==='optional-question');
   assert.equal(optional.status,'running');
   assert.deepEqual(optional.pending,[]);
-  assert(!optionalAlerts.some(a=>a.sessionId==='codex:optional-question'&&a.kind==='wait'));
-  assert(!state.snapshot.events.some(a=>a.sessionId==='codex:optional-question'&&a.kind==='wait'));
+  assert.equal(optional.title,'Optional run');
+  execFileSync(hook,['hook','--home',home],{input:JSON.stringify({session_id:'optional-question',turn_id:'optional',hook_event_name:'PreToolUse',tool_name:'functions.request_user_input_async',tool_use_id:'optional-2',tool_input:{questions:[{title:'Second preference'}]}})});
+  execFileSync(hook,['hook','--home',home],{input:JSON.stringify({session_id:'optional-question',turn_id:'optional',hook_event_name:'UserPromptSubmit',prompt:'Follow up'})});
+  for(let i=0;i<30;i++){state=await rpc('poll',{client:'wb-switch'});if(!state.snapshot.sessions.find(s=>s.sessionId==='optional-question')?.pending.length)break;await delay(100);}
+  optional=state.snapshot.sessions.find(s=>s.sessionId==='optional-question');
+  assert.deepEqual(optional.pending,[]);
+  assert.equal(optional.title,'Follow up');
   const ideHooks=JSON.parse(await fs.readFile(path.join(home,'.codebuddy/settings.json')));
   assert(ideHooks.hooks.Stop.some(g=>g.hooks.some(h=>h.command==='echo keep-ide-hook')));
   assert(ideHooks.hooks.PreToolUse.some(g=>g.hooks.some(h=>h.command.includes('--source codebuddy-ide'))));
@@ -91,7 +107,7 @@ try {
   assert(!state.snapshot.sessions.some(s=>s.source==='codebuddy-ide'));
   await assert.rejects(fs.access(path.join(home,'.agent-studio/codex-resume.json')));
   await rpc('leave',{client:'wb-switch'});
-  console.log('PASS: Codex + IDE native hooks, disabled IDE ignores hooks, two clients, service lock, owner handoff, isolated config, authenticated RPC');
+  console.log('PASS: Codex + IDE native hooks, async question wait/answer, disabled IDE ignores hooks, two clients, service lock, owner handoff, isolated config, authenticated RPC');
 } finally {
   child.kill('SIGTERM');
   await fs.rm(home,{recursive:true,force:true});

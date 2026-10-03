@@ -1,11 +1,10 @@
-import { useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, CircleAlert, ExternalLink, Folder, Loader2 } from "lucide-react";
+import { useEffect, useLayoutEffect, useState } from "react";
+import { CircleAlert, ExternalLink, Loader2 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 
 import { AccountNoteChip, accountNote } from "@/components/account-note-chip";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -15,10 +14,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { DialogAutoHeight } from "@/components/ui/dialog-auto-height";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { SessionSyncSection, type SessionLinksMeta } from "@/components/session-sync-section";
+import { SessionTreeList } from "@/components/session-tree";
 import * as api from "@/lib/api";
+import { displayName } from "@/lib/account-display";
 import { accountVariant, variantAppName } from "@/lib/variant";
 import type {
   AccountMeta,
@@ -51,7 +53,7 @@ function tabCount(count: number) {
 /**
  * 会话列表区最小高度：加载态、空态与列表共用同一下沿。
  *
- * 弹窗垂直居中（`translate-y-[-50%]` 按自身高度算），内容高度一变弹窗就上下撑开；
+ * 弹窗垂直居中，内容高度一变弹窗就上下撑开；
  * 打开时先渲染加载态、会话数据到达后换成列表，两端高度差越大跳得越明显。
  * 与「关联会话」tab 的下沿取同一数值，两个 tab 打开时的高度表现保持一致。
  */
@@ -95,6 +97,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   /** 关联会话区块上报的状态：tab 徽标与常驻提示用。 */
   const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
 
+  const variant = accountVariant(account);
+  const accountId = account?.id;
+
   // 监听后端切换进度：桌面端走 Tauri 事件，webui 走 HTTP 轮询
   useEffect(() => {
     if (api.isWebui()) {
@@ -116,27 +121,36 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     };
   }, []);
 
-  // 打开时按目标账号档位加载当前账号会话（会话列表按档位取自各自的登录态）
-  useEffect(() => {
-    if (open && account) {
-      setSelected(new Set());
-      setExpanded(new Set());
-      setError("");
-      setSyncSelections([]);
-      setSyncGroups([]);
-      setLinksMeta(null);
-      setTab("links");
-      setLoadingSessions(true);
-      api
-        .listSessions(accountVariant(account))
-        .then((res) => {
-          setSessions(res.sessions);
-          setCurrentUid(res.current);
-        })
-        .catch((e) => setError(api.asError(e)))
-        .finally(() => setLoadingSessions(false));
-    }
-  }, [open, account]);
+  // 立即打开弹框；首次绘制前重置旧内容，两个 tab 各自加载数据。
+  useLayoutEffect(() => {
+    if (!open || !accountId) return;
+    let cancelled = false;
+    setSelected(new Set());
+    setExpanded(new Set());
+    setPermCheck(null);
+    setError("");
+    setSessions([]);
+    setCurrentUid(null);
+    setSyncSelections([]);
+    setSyncGroups([]);
+    setLinksMeta(null);
+    setTab("links");
+    setLoadingSessions(true);
+    void api.listSessions(variant)
+      .then((res) => {
+        if (cancelled) return;
+        setSessions(res.sessions);
+        setCurrentUid(res.current);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(api.asError(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingSessions(false);
+      });
+    // 关闭时只取消回写，保留内容到退出动画结束。
+    return () => { cancelled = true; };
+  }, [open, accountId, variant]);
 
   function toggleSession(id: string) {
     setSelected((prev) => {
@@ -180,7 +194,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         // 勾选绑定预览凭据；执行前后端会重新校验，版本变化则跳过该项。
         syncSelections: requestedSync ? syncSelections : undefined,
       });
-      const nickname = account.nickname || account.email || account.uid || "该账号";
+      const nickname = displayName(account);
       const parts: string[] = [];
       const copyReport = res.sessionCopy;
       const copiedCount = copyReport?.copied?.length ?? 0;
@@ -319,7 +333,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
 
   // 出现「无权限」错误时，自动每 2s 轮询一次授权状态；用户拖入 app 授权成功后自动恢复
   useEffect(() => {
-    if (!error.includes("无权限")) return;
+    if (!open || !error.includes("无权限")) return;
     let cancelled = false;
     let timer: number | undefined;
     const check = async () => {
@@ -342,7 +356,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       cancelled = true;
       if (timer) window.clearTimeout(timer);
     };
-  }, [error]);
+  }, [error, open, variant]);
 
   const copyCount = selected.size;
   const syncCount = syncSelections.length;
@@ -419,97 +433,15 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           {currentUid ? "当前账号暂无会话" : "未检测到当前登录账号，无法列出会话"}
         </p>
       ) : (
-        <div className={`max-h-[min(22rem,45vh)] overflow-y-auto pr-1 ${LIST_MIN_H}`}>
-          {buildSessionTree(sessions).map((kind) => {
-            const kindOpen = expanded.has(kind.key);
-            const kindSel = selectionState(kind.sessions, selected);
-            return (
-              <div key={kind.key} className="mb-0.5">
-                <div className="sticky top-0 z-10 flex items-center gap-1.5 rounded-md bg-background px-1.5 py-1">
-                  <TreeCheckbox
-                    allOn={kindSel.allOn}
-                    someOn={kindSel.someOn}
-                    onChange={() => toggleFolder(kind.sessions.map((s) => s.id))}
-                    ariaLabel={`选择${kind.label}`}
-                  />
-                  <button
-                    type="button"
-                    className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-accent/50"
-                    onClick={() => toggleExpanded(kind.key)}
-                    aria-expanded={kindOpen}
-                    aria-label={`${kindOpen ? "折叠" : "展开"}${kind.label}`}
-                  >
-                    <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                      {kind.label}
-                      <span className="ml-1 font-normal text-muted-foreground">
-                        ({kind.count})
-                      </span>
-                    </span>
-                    {kindOpen ? (
-                      <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
-                    ) : (
-                      <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
-                    )}
-                  </button>
-                </div>
-                {kindOpen && kind.key === "task" &&
-                  kind.sessions.map((s) => (
-                    <SessionPickRow
-                      key={s.id}
-                      session={s}
-                      checked={selected.has(s.id)}
-                      indentClass="pl-7"
-                      onToggle={() => toggleSession(s.id)}
-                    />
-                  ))}
-                {kindOpen &&
-                  kind.folders?.map((folder) => {
-                    const folderOpen = expanded.has(folder.key);
-                    const folderSel = selectionState(folder.sessions, selected);
-                    return (
-                      <div key={folder.key}>
-                        <div className="flex items-center gap-1.5 px-1.5 py-0.5 pl-7">
-                          <TreeCheckbox
-                            allOn={folderSel.allOn}
-                            someOn={folderSel.someOn}
-                            onChange={() => toggleFolder(folder.sessions.map((s) => s.id))}
-                            ariaLabel={`选择文件夹 ${folder.label}`}
-                          />
-                          <button
-                            type="button"
-                            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-accent/50"
-                            onClick={() => toggleExpanded(folder.key)}
-                            aria-expanded={folderOpen}
-                            aria-label={`${folderOpen ? "折叠" : "展开"}文件夹 ${folder.label}`}
-                          >
-                            <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-                            <span className="min-w-0 flex-1 truncate text-sm">
-                              {folder.label}
-                            </span>
-                            {folderOpen ? (
-                              <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
-                            ) : (
-                              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
-                            )}
-                          </button>
-                        </div>
-                        {folderOpen &&
-                          folder.sessions.map((s) => (
-                            <SessionPickRow
-                              key={s.id}
-                              session={s}
-                              checked={selected.has(s.id)}
-                              indentClass="pl-12"
-                              onToggle={() => toggleSession(s.id)}
-                            />
-                          ))}
-                      </div>
-                    );
-                  })}
-              </div>
-            );
-          })}
-        </div>
+        <SessionTreeList
+          sessions={sessions}
+          selected={selected}
+          expanded={expanded}
+          onToggleSession={toggleSession}
+          onToggleGroup={toggleFolder}
+          onToggleExpanded={toggleExpanded}
+          className={`max-h-[min(22rem,45vh)] overflow-y-auto pr-1 ${LIST_MIN_H}`}
+        />
       )}
     </>
   );
@@ -518,10 +450,12 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         showCloseButton={!busy}
-        className="flex max-h-[min(90vh,calc(100vh-2rem))] min-w-0 flex-col overflow-hidden"
+        className="flex max-h-[min(90vh,calc(100vh-2rem))] min-w-0 flex-col gap-0 overflow-hidden p-0"
       >
+        <DialogAutoHeight>
+        <div className="flex max-h-[calc(min(90vh,100vh-2rem)-2px)] min-w-0 flex-col gap-4 p-6">
         <DialogHeader className="shrink-0">
-          <DialogTitle>切换到「{account?.nickname || account?.email || account?.uid || "该账号"}」</DialogTitle>
+          <DialogTitle>切换到「{account ? displayName(account) : "该账号"}」</DialogTitle>
           <DialogDescription>切换时将重启 {variantAppName(accountVariant(account))}。</DialogDescription>
           {/* 备注跟在这里：点下「确认切换」之前最后一眼就能核对是不是想切的那个号，比回列表翻更可靠。 */}
           {note && <AccountNoteChip note={note} />}
@@ -656,130 +590,10 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             </Button>
           </div>
         </DialogFooter>
+        </div>
+        </DialogAutoHeight>
       </DialogContent>
     </Dialog>
   );
 }
 
-type FolderGroup = { key: string; label: string; sessions: Session[] };
-type KindGroup = {
-  key: "task" | "space";
-  label: string;
-  count: number;
-  sessions: Session[];
-  folders?: FolderGroup[];
-};
-
-function selectionState(sessions: Session[], selected: Set<string>) {
-  const ids = sessions.map((s) => s.id);
-  const n = ids.filter((id) => selected.has(id)).length;
-  return { allOn: n === ids.length && ids.length > 0, someOn: n > 0 && n < ids.length };
-}
-
-function TreeCheckbox({
-  allOn,
-  someOn,
-  onChange,
-  ariaLabel,
-}: {
-  allOn: boolean;
-  someOn: boolean;
-  onChange: () => void;
-  ariaLabel: string;
-}) {
-  return (
-    <input
-      type="checkbox"
-      className="size-3.5 shrink-0 cursor-pointer accent-primary"
-      checked={allOn}
-      ref={(el) => {
-        if (el) el.indeterminate = someOn;
-      }}
-      onChange={onChange}
-      aria-label={ariaLabel}
-    />
-  );
-}
-
-function SessionPickRow({
-  session,
-  checked,
-  indentClass,
-  onToggle,
-}: {
-  session: Session;
-  checked: boolean;
-  indentClass: string;
-  onToggle: () => void;
-}) {
-  return (
-    <label
-      className={`flex cursor-pointer items-center gap-2.5 rounded-md py-1.5 pr-2 hover:bg-accent/50 ${indentClass}`}
-    >
-      <input
-        type="checkbox"
-        className="size-3.5 shrink-0 cursor-pointer accent-primary"
-        checked={checked}
-        onChange={onToggle}
-      />
-      <span className="min-w-0 flex-1 truncate text-sm" title={session.title}>
-        {session.title}
-      </span>
-      {session.hasHistory && (
-        <Badge variant="outline" className="shrink-0 text-[10px]">
-          有内容
-        </Badge>
-      )}
-    </label>
-  );
-}
-
-/** WorkBuddy 侧栏文件夹名：cwd 最后一段。 */
-function sessionFolderLabel(cwd: string): string {
-  const normalized = cwd.trim().replace(/[\\/]+$/, "");
-  if (!normalized) return "未分组";
-  const parts = normalized.split(/[\\/]/);
-  return parts[parts.length - 1] || normalized;
-}
-
-/** 按工作目录分组，文件夹顺序跟会话一样按最近活动排。 */
-function groupSessionsByFolder(sessions: Session[]): FolderGroup[] {
-  const groups = new Map<string, Session[]>();
-  const order: string[] = [];
-  for (const session of sessions) {
-    const key = session.cwd.trim() || "__none__";
-    let list = groups.get(key);
-    if (!list) {
-      list = [];
-      groups.set(key, list);
-      order.push(key);
-    }
-    list.push(session);
-  }
-  return order.map((key) => ({
-    key,
-    label: key === "__none__" ? "未分组" : sessionFolderLabel(key),
-    sessions: groups.get(key) ?? [],
-  }));
-}
-
-/** 对齐 WorkBuddy 侧栏：任务（playground）平铺，空间按文件夹分组。 */
-function buildSessionTree(sessions: Session[]): KindGroup[] {
-  const tasks = sessions.filter((s) => s.isPlayground);
-  const spaces = sessions.filter((s) => !s.isPlayground);
-  const groups: KindGroup[] = [];
-  if (tasks.length > 0) {
-    groups.push({ key: "task", label: "任务", count: tasks.length, sessions: tasks });
-  }
-  if (spaces.length > 0) {
-    const folders = groupSessionsByFolder(spaces);
-    groups.push({
-      key: "space",
-      label: "空间",
-      count: folders.length,
-      sessions: spaces,
-      folders,
-    });
-  }
-  return groups;
-}
